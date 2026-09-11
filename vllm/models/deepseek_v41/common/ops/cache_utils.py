@@ -32,6 +32,11 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils.fp8_e4m3 import (
+    e4m3fn_bits_to_fp32,
+    fp32_to_e4m3fn_bits,
+    needs_e4m3fn_emulation,
+)
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.math_utils import next_power_of_2
 
@@ -74,6 +79,7 @@ def quantize_and_insert_k_kernel(
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
     use_fnuz: tl.constexpr = False,
+    emulate_e4m3: tl.constexpr = False,
 ):
     """Quantize K tensor and insert into paged K cache.
 
@@ -150,11 +156,14 @@ def quantize_and_insert_k_kernel(
             x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
 
             # Convert to fp8 (FNUZ on gfx942, OCP elsewhere), then bitcast to uint8.
-            if use_fnuz:
-                x_fp8 = x_clamped.to(tl.float8e4b8)
+            if emulate_e4m3:
+                x_uint8 = fp32_to_e4m3fn_bits(x_clamped)
             else:
-                x_fp8 = x_clamped.to(tl.float8e4nv)
-            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+                if use_fnuz:
+                    x_fp8 = x_clamped.to(tl.float8e4b8)
+                else:
+                    x_fp8 = x_clamped.to(tl.float8e4nv)
+                x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
 
             # Store as uint8 (1 byte each)
             tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
@@ -319,6 +328,7 @@ def quantize_and_insert_k_cache(
         fp8_max=FP8_MAX,
         n_quant_blocks=8,
         use_fnuz=use_fnuz,
+        emulate_e4m3=not use_fnuz and needs_e4m3fn_emulation(),
     )
 
 
@@ -345,6 +355,7 @@ def _dequantize_and_gather_k_kernel(
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 7 real blocks
     use_fnuz: tl.constexpr = False,
+    emulate_e4m3: tl.constexpr = False,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -402,14 +413,16 @@ def _dequantize_and_gather_k_kernel(
                 # Load quantized fp8 values (stored as uint8)
                 x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
 
-                # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
-                if use_fnuz:
-                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+                # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere)
+                # and widen to float32 for computation.
+                if emulate_e4m3:
+                    x_float = e4m3fn_bits_to_fp32(x_uint8)
                 else:
-                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-
-                # Convert fp8 to float32 for computation
-                x_float = x_fp8.to(tl.float32)
+                    if use_fnuz:
+                        x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+                    else:
+                        x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+                    x_float = x_fp8.to(tl.float32)
 
                 # Load and decode UE8M0 scale
                 # UE8M0: scale = 2^(stored_value - 127)
@@ -654,6 +667,7 @@ def dequantize_and_gather_k_cache_triton(
         fp8_max=FP8_MAX,
         n_quant_blocks=7,
         use_fnuz=use_fnuz,
+        emulate_e4m3=not use_fnuz and needs_e4m3fn_emulation(),
     )
 
 
@@ -683,7 +697,13 @@ def dequantize_and_gather_k_cache(
     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
     writes FNUZ on gfx942 and OCP on gfx950).
     """
-    if has_cutedsl() and k_cache.shape[-1] != V41_NVFP4_BYTES_PER_TOKEN:
+    # has_cutedsl() only says the package imports; the CuteDSL kernel needs
+    # native fp8, and libNVVM rejects it below SM 8.9.
+    if (
+        has_cutedsl()
+        and k_cache.shape[-1] != V41_NVFP4_BYTES_PER_TOKEN
+        and not needs_e4m3fn_emulation()
+    ):
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
             _DEQUANT_GATHER_K_CACHE_CUTEDSL_KERNEL,

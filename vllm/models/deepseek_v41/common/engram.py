@@ -51,6 +51,7 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils.fp8_e4m3 import e4m3fn_bits_to_fp32, needs_e4m3fn_emulation
 
 logger = init_logger(__name__)
 
@@ -602,11 +603,13 @@ def _engram_lookup_kernel(
     QUANT_BLOCK: tl.constexpr,
     BLOCK_R: tl.constexpr,
     GRID,
+    EMULATE_E4M3: tl.constexpr,
 ):
     """Gather fp8 rows, apply their ue8m0 block scales, write bf16.
 
     Only this rank's heads are read; padded heads write zeros for all-gather.
     `weight`/`scales` may address pinned host memory through UVA.
+    With `EMULATE_E4M3` the weight arrives as uint8 and is decoded in-kernel.
     """
     cols = tl.arange(0, DIM)
     scale_cols = cols // QUANT_BLOCK
@@ -623,11 +626,20 @@ def _engram_lookup_kernel(
         owned = valid & (head < TOTAL_HEADS)
         owned &= (index >= vocab_start) & (index < vocab_end)
         local = tl.where(owned, index - vocab_start, 0)
-        values = tl.load(
-            weight + local[:, None] * DIM + cols[None, :],
-            mask=owned[:, None],
-            other=0.0,
-        )
+        if EMULATE_E4M3:
+            values = e4m3fn_bits_to_fp32(
+                tl.load(
+                    weight + local[:, None] * DIM + cols[None, :],
+                    mask=owned[:, None],
+                    other=0,
+                )
+            )
+        else:
+            values = tl.load(
+                weight + local[:, None] * DIM + cols[None, :],
+                mask=owned[:, None],
+                other=0.0,
+            )
         scale = tl.load(
             scales + local[:, None] * (DIM // QUANT_BLOCK) + scale_cols[None, :],
             mask=owned[:, None],
@@ -718,6 +730,9 @@ class ParallelEngramEmbedding(nn.Module):
         # beats one program per row; halve it to leave SMs for the main stream.
         tiles = triton.cdiv(rows, 16)
         grid = min(tiles, self._num_sms // 2 if background else self._num_sms)
+        emulate_e4m3 = needs_e4m3fn_emulation()
+        if emulate_e4m3:
+            weight = weight.view(torch.uint8)
         _engram_lookup_kernel[(grid,)](
             weight,
             scales,
@@ -735,6 +750,7 @@ class ParallelEngramEmbedding(nn.Module):
             QUANT_BLOCK=self.block_size,
             BLOCK_R=16,
             GRID=grid,
+            EMULATE_E4M3=emulate_e4m3,
         )
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:

@@ -17,6 +17,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils.fp8_e4m3 import fp32_to_e4m3fn_bits, needs_e4m3fn_emulation
 
 from . import MXFP4_BLOCK_SIZE, _fp32x2_to_fp4x2
 
@@ -114,6 +115,7 @@ def indexer_k_norm_rope_store(
         SHUFFLE=shuffle,
         BLOCK_TILE_SIZE=_BLOCK_TILE_SIZE,
         HEAD_TILE_SIZE=_HEAD_TILE_SIZE,
+        EMULATE_E4M3=needs_e4m3fn_emulation(),
         num_warps=1,
         **launch_kwargs,
     )
@@ -142,6 +144,7 @@ def _indexer_k_norm_rope_quant_store_kernel(
     SHUFFLE: tl.constexpr,
     BLOCK_TILE_SIZE: tl.constexpr,
     HEAD_TILE_SIZE: tl.constexpr,
+    EMULATE_E4M3: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
 
@@ -243,7 +246,10 @@ def _indexer_k_norm_rope_quant_store_kernel(
         exponent = tl.ceil(tl.log2(absmax * INV_FP8_MAX))
         inv_scale = tl.exp2(-exponent)
         x_clamped = tl.clamp(result_bf16 * inv_scale, -FP8_MAX, FP8_MAX)
-        x_uint8 = x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+        if EMULATE_E4M3:
+            x_uint8 = fp32_to_e4m3fn_bits(x_clamped)
+        else:
+            x_uint8 = x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
         if SHUFFLE:
             tiled = (
                 block // HEAD_TILE_SIZE * BLOCK_TILE_SIZE * HEAD_TILE_SIZE
