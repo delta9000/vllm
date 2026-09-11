@@ -6,6 +6,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils.fp8_e4m3 import fp32_to_e4m3fn_bits, needs_e4m3fn_emulation
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX950
@@ -258,6 +259,7 @@ def rope_quant_insert(
             CACHE_BLOCK=kv_cache.shape[1],
             COMPRESS_RATIO=compress_ratio,
             SANITIZE_CACHE_NANS=_ON_GFX950,
+            EMULATE_E4M3=needs_e4m3fn_emulation(),
             num_warps=4,
             **launch_kwargs,
         )
@@ -299,6 +301,7 @@ def _rope_quant_insert_kernel(
     CACHE_BLOCK: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     SANITIZE_CACHE_NANS: tl.constexpr,
+    EMULATE_E4M3: tl.constexpr,
 ):
     t = tl.program_id(0)
     slot = tl.load(cache_slots + t)
@@ -317,8 +320,12 @@ def _rope_quant_insert_kernel(
     amax = tl.maximum(tl.max(tl.abs(quant), 1), 1e-4)
     exponent = tl.ceil(tl.log2(amax * (1.0 / 448.0)))
     scaled = quant * tl.reshape(tl.exp2(-exponent), (8, 1))
-    fp8 = tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv)
-    packed = tl.reshape(fp8.to(tl.uint8, bitcast=True), (512,))
+    clamped = tl.clamp(scaled, -448.0, 448.0)
+    if EMULATE_E4M3:
+        bits = fp32_to_e4m3fn_bits(clamped)
+    else:
+        bits = clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+    packed = tl.reshape(bits, (512,))
     tl.store(values + d, packed, d < 448)
     s = tl.arange(0, 8)
     max_encoded: tl.constexpr = 254.0 if SANITIZE_CACHE_NANS else 255.0
