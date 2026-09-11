@@ -5,9 +5,11 @@
 Ampere has neither FlashMLA-sparse (SM 9.x/10.x) nor FlashInfer sparse MLA
 (SM 10.x/12.x). This backend keeps everything the FlashMLA layer does --
 metadata, KV gathering, top-k + SWA index merging, the prefill chunk plan,
-image-token visibility, and its o_proj, whose bf16 fallback applies because
-MXFP8 ``wo_a`` is dequantized at load on these GPUs -- and swaps only the two
-attention kernels for the portable Triton sparse-MLA kernels.
+image-token visibility -- and swaps the two attention kernels for the
+portable Triton sparse-MLA kernels. Its o_proj runs the grouped ``wo_a``
+in MXFP8 through ``TritonMxfp8LinearKernel`` when that kernel was selected
+for the layer; otherwise (``VLLM_DISABLED_KERNELS``) it falls back to the
+FlashMLA layer's bf16 ``torch.bmm`` over the load-time dequantized weight.
 
 Those kernels live in ``vllm/v1/attention/ops/rocm_aiter_mla_sparse.py``.
 Despite the module name they are plain Triton; its AITER fast paths are
@@ -19,6 +21,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.model_executor.kernels.linear.mxfp8.triton_ampere import (
+    TritonMxfp8LinearKernel,
+)
+from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
+    fused_inv_rope_fp8_quant,
+)
 from vllm.models.deepseek_v4_1.common.ops import compute_global_topk_indices_and_lens
 from vllm.models.deepseek_v4_1.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4_1.sparse_mla import (
@@ -73,6 +81,36 @@ class DeepseekV41TritonMLAAttention(DeepseekV4FlashMLAAttention):
         # The Triton kernels mask heads themselves; FlashMLA's 64/128
         # padding would only add work.
         return num_heads
+
+    def _wo_a_is_triton_mxfp8(self) -> bool:
+        # The kernel is (re)selected in process_weights_after_loading, so
+        # resolve on first forward rather than in __init__.
+        cached = getattr(self, "_wo_a_triton_mxfp8", None)
+        if cached is None:
+            kernel = getattr(self.wo_a.quant_method, "kernel", None)
+            cached = isinstance(kernel, TritonMxfp8LinearKernel)
+            self._wo_a_triton_mxfp8 = cached
+        return cached
+
+    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        if not self._wo_a_is_triton_mxfp8():
+            return super()._o_proj(o, positions)
+        # Inverse RoPE only (no activation quant: W8A16), then the grouped
+        # fp8 wo_a directly on the [T, G, D] view the op returns.
+        o_proj_input, _ = fused_inv_rope_fp8_quant(
+            o,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            n_groups=self.n_local_groups,
+            heads_per_group=self.n_local_heads // self.n_local_groups,
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.rope_head_dim,
+            quant_group_size=self._o_proj_block_size,
+            tma_aligned_scales=False,
+            quantize=False,
+        )
+        z = self.wo_a(o_proj_input)  # [T, G, o_lora_rank]
+        return self.wo_b(z.flatten(1))
 
     def _sparse_prefill(
         self,
