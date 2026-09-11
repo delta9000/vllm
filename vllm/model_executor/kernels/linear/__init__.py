@@ -867,7 +867,14 @@ def init_mxfp8_linear_kernel(*, bmm_batch_size: int | None = None) -> Mxfp8Linea
     possible: list[type[Mxfp8LinearKernel]]
     if bmm_batch_size is not None:
         possible = (
-            [DeepGemmMxfp8BmmLinearKernel, EmulationMxfp8LinearKernel]
+            # bmm_batch_size == 1 is a plain linear: Marlin (SM 8.0+) keeps it
+            # in MXFP8 instead of Emulation's bf16 dequant at load, which
+            # doubles the bytes read per decode step.
+            [
+                DeepGemmMxfp8BmmLinearKernel,
+                MarlinMxfp8LinearKernel,
+                EmulationMxfp8LinearKernel,
+            ]
             if current_platform.is_cuda()
             else []
         )

@@ -20,6 +20,12 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.models.deepseek_v4_1.common.ops import compute_global_topk_indices_and_lens
+from vllm.model_executor.kernels.linear.mxfp8.marlin import (
+    MarlinMxfp8LinearKernel,
+)
+from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
+    fused_inv_rope_fp8_quant,
+)
 from vllm.models.deepseek_v4_1.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4_1.sparse_mla import (
     DeepseekV4FlashMLABackend,
@@ -67,6 +73,42 @@ class DeepseekV41TritonMLAAttention(DeepseekV4FlashMLAAttention):
     # prompts still share a chunk at 1; only several maximum-length prompts at
     # once are split. On 48 GB parts that memory is worth more as KV cache.
     PREFILL_CHUNK_SIZE = 1
+
+    def _wo_a_keeps_fp8(self) -> bool:
+        """Whether wo_a is still MXFP8 after load (Marlin), not bf16.
+
+        Emulation dequantizes the weight at load and needs the inherited
+        torch.bmm path. The kernel is selected in
+        process_weights_after_loading, so resolve on first forward.
+        """
+        cached = getattr(self, "_wo_a_fp8", None)
+        if cached is None:
+            kernel = getattr(self.wo_a.quant_method, "kernel", None)
+            cached = isinstance(kernel, MarlinMxfp8LinearKernel)
+            self._wo_a_fp8 = cached
+        return cached
+
+    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        if not self._wo_a_keeps_fp8():
+            return super()._o_proj(o, positions)
+        # Inverse RoPE only (W8A16: no activation quant), then wo_a on the
+        # [T, G, D] view the op returns; Marlin flattens the G == 1 axis.
+        # deep_gemm_fp8_o_proj's bf16 branch cannot be used here: it would
+        # .view() Marlin's repacked int32 weight.
+        o_proj_input, _ = fused_inv_rope_fp8_quant(
+            o,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            n_groups=self.n_local_groups,
+            heads_per_group=self.n_local_heads // self.n_local_groups,
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.rope_head_dim,
+            quant_group_size=self._o_proj_block_size,
+            tma_aligned_scales=False,
+            quantize=False,
+        )
+        z = self.wo_a(o_proj_input)  # [T, G, o_lora_rank]
+        return self.wo_b(z.flatten(1))
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:

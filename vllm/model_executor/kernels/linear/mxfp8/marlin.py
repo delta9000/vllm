@@ -23,6 +23,11 @@ class MarlinMxfp8LinearKernel(Mxfp8LinearKernel):
 
     @classmethod
     def can_implement(cls, c: Mxfp8LinearLayerConfig) -> tuple[bool, str | None]:
+        # A single-group "BMM" (DeepSeek V4 wo_a when TP == n_groups) is a
+        # plain [T, K] x [N, K] linear; apply_mxfp8_marlin_linear flattens the
+        # leading [T, 1] and restores it. Real groups need a grouped kernel.
+        if c.bmm_batch_size is not None and c.bmm_batch_size != 1:
+            return False, "Marlin MXFP8 implements bmm_batch_size == 1 only"
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
