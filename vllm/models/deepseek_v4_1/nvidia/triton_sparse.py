@@ -61,6 +61,13 @@ class DeepseekV41TritonMLAAttention(DeepseekV4FlashMLAAttention):
     backend_cls = DeepseekV41TritonMLASparseBackend
     swa_backend_cls = DeepseekSparseSWATritonBackend
 
+    # The prefill gather workspace is PREFILL_CHUNK_SIZE full-context rows of
+    # bf16 KV, reserved for the whole run: 2.09 GB per rank at 512k with the
+    # default 4. The chunk plan packs requests by area, so short concurrent
+    # prompts still share a chunk at 1; only several maximum-length prompts at
+    # once are split. On 48 GB parts that memory is worth more as KV cache.
+    PREFILL_CHUNK_SIZE = 1
+
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         # The Triton kernels mask heads themselves; FlashMLA's 64/128

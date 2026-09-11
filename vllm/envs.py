@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR: int = 40
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -1087,6 +1088,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default: 512 MB
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+    ),
+    # Sparse-indexer prefill K-gather workspace, in multiples of max_model_len
+    # tokens (132 bytes each). It is reserved for the whole run and is usually
+    # the largest workspace: 40 x 512k tokens is 2.6 GiB per rank. Prefill
+    # chunks are split to fit it, so 1 is enough for any single request;
+    # larger values let several long prompts share one chunk.
+    "VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR": lambda: int(
+        os.getenv("VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR", "40")
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.

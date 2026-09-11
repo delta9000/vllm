@@ -614,7 +614,16 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     # within the flashmla_sparse workspace.
     # For DeepSeek-V3.2, the max_model_len is 163840.
     #   40 * 163840 * 132 = 865075200 bytes = 825 MB
-    return max_model_len * 40
+    # The factor is VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR (default 40). At
+    # long contexts this workspace dominates, and on small-memory GPUs it is
+    # better spent as KV cache. It must be >= 1: prefill chunks are split to
+    # fit it, but one request's compressed context can never be split.
+    factor = envs.VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR
+    if factor < 1:
+        raise ValueError(
+            f"VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR must be >= 1, got {factor}"
+        )
+    return max_model_len * factor
 
 
 def _supports_varlen_paged_mqa_logits() -> bool:
