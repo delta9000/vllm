@@ -125,11 +125,22 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     The generic CUDA backend selector does not instantiate DSv4 layers directly,
     so map generic sparse-MLA choices to the DSv4-specialized attention class.
     Without an explicit backend: SM12 takes FlashInfer, SM100 takes mega
-    attention where the topology allows it, and everything else keeps the
-    FlashMLA path.
+    attention where the topology allows it, SM8 (which has neither FlashMLA nor
+    FlashInfer sparse MLA) takes the Triton kernels, and everything else keeps
+    the FlashMLA path.
     """
     backend = vllm_config.attention_config.backend
     device_capability = current_platform.get_device_capability()
+    if backend == AttentionBackendEnum.TRITON_MLA_SPARSE_DSV41 or (
+        backend is None
+        and device_capability is not None
+        and device_capability.major == 8
+    ):
+        from vllm.models.deepseek_v41.nvidia.triton_sparse import (
+            DeepseekV41TritonMLAAttention,
+        )
+
+        return DeepseekV41TritonMLAAttention
     if backend in (
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,

@@ -16,6 +16,7 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils.fp8_e4m3 import e4m3fn_bits_to_bf16, needs_e4m3fn_emulation
 from vllm.utils.torch_utils import LayerNameType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
@@ -2041,6 +2042,9 @@ def _sparse_attn_decode_ragged_kernel(
     IS_FNUZ_EXTRA: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    # OCP e4m3 decoded with integer ops, for CUDA below SM 8.9 (the only
+    # platform that reaches this fallback without native fp8e4nv).
+    EMULATE_E4M3: tl.constexpr = False,
 ):
     query_idx = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -2095,7 +2099,9 @@ def _sparse_attn_decode_ragged_kernel(
             mask=valid[:, None] & nope_mask[None, :],
             other=0,
         )
-        if IS_FNUZ_MAIN:
+        if EMULATE_E4M3:
+            x_fp8 = e4m3fn_bits_to_bf16(x_uint8)
+        elif IS_FNUZ_MAIN:
             x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
         else:
             x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
@@ -2163,7 +2169,9 @@ def _sparse_attn_decode_ragged_kernel(
                 mask=valid[:, None] & nope_mask[None, :],
                 other=0,
             )
-            if IS_FNUZ_EXTRA:
+            if EMULATE_E4M3:
+                x_fp8 = e4m3fn_bits_to_bf16(x_uint8)
+            elif IS_FNUZ_EXTRA:
                 x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
             else:
                 x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
@@ -3425,6 +3433,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             IS_FNUZ_EXTRA=False,
             BLOCK_H=block_h,
             BLOCK_K=block_k,
+            EMULATE_E4M3=not is_fnuz and needs_e4m3fn_emulation(),
             num_warps=8,
         )
         return out

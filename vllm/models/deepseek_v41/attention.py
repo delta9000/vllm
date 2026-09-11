@@ -626,6 +626,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 "FLASHMLA_SPARSE_DSV41",
                 "FLASHMLA_MEGA_ATTN_DSV41",
                 "ROCM_FLASHMLA_SPARSE_DSV4",
+                "TRITON_MLA_SPARSE_DSV41",
             ):
                 from vllm.models.deepseek_v41.common.ops.cache_utils import (
                     _COMBINE_TOPK_SWA_INDICES_KERNEL,
