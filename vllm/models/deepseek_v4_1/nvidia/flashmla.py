@@ -376,12 +376,33 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 ),
                 max_image_tokens=self.max_image_tokens,
             )
-            flash_mla_sparse_fwd(
+            self._sparse_prefill(
                 q=q[query_start:query_end],
                 kv=kv.view(-1, 1, q.shape[-1]),
-                indices=combined_indices.unsqueeze(1),
-                sm_scale=self.scale,
-                attn_sink=self.attn_sink,
+                indices=combined_indices,
                 topk_length=combined_lens,
                 out=output[query_start:query_end],
             )
+
+    def _sparse_prefill(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        """Sparse attention of prefill queries over the gathered bf16 KV.
+
+        ``kv`` is ``[S, 1, D]``; each query attends to the first
+        ``topk_length`` entries of its ``indices`` row.
+        """
+        flash_mla_sparse_fwd(
+            q=q,
+            kv=kv,
+            indices=indices.unsqueeze(1),
+            sm_scale=self.scale,
+            attn_sink=self.attn_sink,
+            topk_length=topk_length,
+            out=out,
+        )

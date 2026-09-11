@@ -535,6 +535,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             if self.backend_cls.get_name() in (
                 "FLASHMLA_SPARSE_DSV41",
                 "ROCM_FLASHMLA_SPARSE_DSV4",
+                "TRITON_MLA_SPARSE_DSV41",
             ):
                 from vllm.models.deepseek_v4_1.common.ops.cache_utils import (
                     _COMBINE_TOPK_SWA_INDICES_KERNEL,
