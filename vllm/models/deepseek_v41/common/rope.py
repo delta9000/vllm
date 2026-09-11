@@ -51,3 +51,17 @@ def build_deepseek_v4_rope(
         rope_parameters=rope_parameters,
         is_neox_style=False,
     )
+
+
+def truncate_rope_cache(rope: RotaryEmbedding, max_positions: int) -> None:
+    """Drop cos/sin rows for positions the engine can never reach.
+
+    The YaRN cache spans ``original_max_position * factor`` positions (1M for
+    V4.1: 256 MiB of fp32 per distinct table, on every rank) regardless of
+    ``max_model_len``. Row ``i`` is position ``i``, so a prefix is exact.
+    ``get_rope`` shares instances between layers, so this is idempotent; call
+    it before anything takes a reference to ``cos_sin_cache``.
+    """
+    cache = rope.cos_sin_cache
+    if cache.shape[0] > max_positions:
+        rope.cos_sin_cache = cache[:max_positions].clone()
