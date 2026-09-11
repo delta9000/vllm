@@ -397,7 +397,10 @@ class TritonMxfp8LinearKernel(Mxfp8LinearKernel):
     ) -> torch.Tensor:
         G = self.groups
         K = layer.weight.shape[1]
-        if G > 1 or x.ndim == 3:
+        # Only a grouped layer takes the grouped path. A 3-D input to an
+        # ungrouped one is an ordinary [..., K] activation, flattened below;
+        # reading it as [M, G, K] would mistake seq_len for the group.
+        if G > 1:
             # Grouped: x is [M, G, K] (a transposed [G, M, K] buffer from the
             # inverse-RoPE kernel is fine), output [M, G, N].
             assert x.ndim == 3 and x.shape[1] == G and x.shape[2] == K
