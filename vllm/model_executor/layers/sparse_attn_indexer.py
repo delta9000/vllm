@@ -19,11 +19,17 @@ from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     select_candidate_blocks as _select_candidate_blocks,
 )
+from vllm.model_executor.kernels.attention.dsa.mqa_logits_triton import (
+    fp8_mqa_logits_triton,
+    fp8_paged_mqa_logits_triton,
+    use_triton_mqa_logits,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils.fp8_e4m3 import needs_e4m3fn_emulation
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
@@ -517,6 +523,15 @@ def sparse_attn_indexer(
                         cu_seqlen_ks,
                         cu_seqlen_ke,
                     )
+                elif use_triton_mqa_logits():
+                    assert q_scale_slice is None, "Triton MQA logits are FP8-only"
+                    logits = fp8_mqa_logits_triton(
+                        q_slice_cast,
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start : chunk.token_end],
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                    )
                 else:
                     logits = fp8_fp4_mqa_logits(
                         (q_slice_cast, q_scale_slice),
@@ -601,6 +616,16 @@ def sparse_attn_indexer(
                 padded_q_scale = pack_seq_triton(
                     q_scale[:num_decode_tokens], decode_lens, pad_value=0
                 )
+            elif needs_e4m3fn_emulation():
+                # Pack the fp8 bytes; Triton cannot type an fp8e4nv pointer
+                # here. The pad value is irrelevant: padded query rows are
+                # dropped again by unpack_seq_triton below.
+                padded_q_quant_decode_tokens = pack_seq_triton(
+                    q_quant[:num_decode_tokens].view(torch.uint8),
+                    decode_lens,
+                    pad_value=0,
+                ).view(q_quant.dtype)
+                padded_q_scale = None
             else:
                 padded_q_quant_decode_tokens = pack_seq_triton(
                     q_quant[:num_decode_tokens], decode_lens
@@ -642,6 +667,16 @@ def sparse_attn_indexer(
                 seq_lens_xpu,
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
+                max_model_len,
+            )
+        elif use_triton_mqa_logits():
+            assert padded_q_scale is None, "Triton MQA logits are FP8-only"
+            logits = fp8_paged_mqa_logits_triton(
+                padded_q_quant_cast,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
                 max_model_len,
             )
         else:
@@ -859,7 +894,11 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self._cp_kv_cache_interleave_size: int | None = None
-        if current_platform.is_cuda() and not has_deep_gemm():
+        if (
+            current_platform.is_cuda()
+            and not use_triton_mqa_logits()
+            and not has_deep_gemm()
+        ):
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
                 "the current vLLM environment."
@@ -871,10 +910,11 @@ class SparseAttnIndexer(CustomOp):
                 _UNPACK_SEQ_TRITON_KERNEL,
             )
 
-            pack_dtype = torch.uint8 if use_fp4_cache else current_platform.fp8_dtype()
+            # Warm the variant the decode path packs with (see sparse_attn_indexer).
+            pack_bytes = use_fp4_cache or needs_e4m3fn_emulation()
             _PACK_SEQ_TRITON_KERNEL.register_warmup(
-                dtype=pack_dtype,
-                pad_value=0 if use_fp4_cache else -float("inf"),
+                dtype=torch.uint8 if pack_bytes else current_platform.fp8_dtype(),
+                pad_value=0 if pack_bytes else -float("inf"),
             )
             _UNPACK_SEQ_TRITON_KERNEL.register_warmup()
 

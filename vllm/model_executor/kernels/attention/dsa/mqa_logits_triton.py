@@ -23,8 +23,20 @@ dot products run on fp16 tensor cores with an fp32 accumulator.
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.triton_utils.fp8_e4m3 import e4m3fn_bits_to_fp32, needs_e4m3fn_emulation
+
+
+def use_triton_mqa_logits() -> bool:
+    """Whether the CUDA sparse indexer should use these kernels.
+
+    DeepGEMM's MQA-logits kernels (and their scheduling metadata) need
+    SM 9.0+. ``has_deep_gemm()`` cannot be the test: vLLM vendors DeepGEMM,
+    so it imports fine on every GPU and only fails at launch.
+    """
+    return current_platform.is_cuda() and not current_platform.has_device_capability(90)
+
 
 # Tile sizes, swept on A40 (SM 8.6) at H=64, D=128.
 _PAGED_BLOCK_N = 64
