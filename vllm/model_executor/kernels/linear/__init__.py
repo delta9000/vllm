@@ -129,6 +129,9 @@ from vllm.model_executor.kernels.linear.mxfp8.marlin import (
 from vllm.model_executor.kernels.linear.mxfp8.rocm_native import (
     RocmDotScaledMxfp8LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mxfp8.triton_ampere import (
+    TritonMxfp8LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mxfp8.xpu import (
     XPUMxFp8LinearKernel,
 )
@@ -521,6 +524,9 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
 # in priority/performance order (when available)
 _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
     PlatformEnum.CUDA: [
+        # SM 8.x only (is_supported gates it); ahead of Marlin so
+        # VLLM_DISABLED_KERNELS=TritonMxfp8LinearKernel A/Bs the two.
+        TritonMxfp8LinearKernel,
         FlashInferCutedslMxfp8LinearKernel,
         FlashInferCutlassMxfp8LinearKernel,
         MarlinMxfp8LinearKernel,
@@ -867,7 +873,12 @@ def init_mxfp8_linear_kernel(*, bmm_batch_size: int | None = None) -> Mxfp8Linea
     possible: list[type[Mxfp8LinearKernel]]
     if bmm_batch_size is not None:
         possible = (
-            [DeepGemmMxfp8BmmLinearKernel, EmulationMxfp8LinearKernel]
+            [
+                DeepGemmMxfp8BmmLinearKernel,
+                # SM 8.x: grouped fp8 GEMV instead of the bf16 dequant below.
+                TritonMxfp8LinearKernel,
+                EmulationMxfp8LinearKernel,
+            ]
             if current_platform.is_cuda()
             else []
         )
