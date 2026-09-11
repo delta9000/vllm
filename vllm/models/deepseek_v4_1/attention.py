@@ -49,7 +49,10 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.models.deepseek_v4_1.common.rope import build_deepseek_v4_rope
+from vllm.models.deepseek_v4_1.common.rope import (
+    build_deepseek_v4_rope,
+    truncate_rope_cache,
+)
 from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
@@ -350,6 +353,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             rope_head_dim=self.rope_head_dim,
             max_position_embeddings=config.max_position_embeddings,
             compress_ratio=self.compress_ratio,
+        )
+        # Margin covers speculative positions past the last committed token.
+        truncate_rope_cache(
+            self.rotary_emb, vllm_config.model_config.max_model_len + 1024
         )
         self.indexer_rotary_emb = self.rotary_emb
         self.topk_indices_buffer = topk_indices_buffer
