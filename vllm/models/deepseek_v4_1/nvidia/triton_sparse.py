@@ -6,10 +6,11 @@ Ampere has neither FlashMLA-sparse (SM 9.x/10.x) nor FlashInfer sparse MLA
 (SM 10.x/12.x). This backend keeps everything the FlashMLA layer does --
 metadata, KV gathering, top-k + SWA index merging, the prefill chunk plan,
 image-token visibility -- and swaps the two attention kernels for the
-portable Triton sparse-MLA kernels. Its o_proj runs the grouped ``wo_a``
-in MXFP8 through ``TritonMxfp8LinearKernel`` when that kernel was selected
-for the layer; otherwise (``VLLM_DISABLED_KERNELS``) it falls back to the
-FlashMLA layer's bf16 ``torch.bmm`` over the load-time dequantized weight.
+portable Triton sparse-MLA kernels. Its o_proj keeps ``wo_a`` in MXFP8 --
+through Marlin when the rank holds a single o-group (TP == o_groups) or the
+grouped Triton kernel otherwise -- and only falls back to the FlashMLA
+layer's bf16 ``torch.bmm`` over a load-time dequantized weight when neither
+kernel was selected (``VLLM_DISABLED_KERNELS``).
 
 Those kernels live in ``vllm/v1/attention/ops/rocm_aiter_mla_sparse.py``.
 Despite the module name they are plain Triton; its AITER fast paths are
@@ -21,6 +22,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.model_executor.kernels.linear.mxfp8.marlin import (
+    MarlinMxfp8LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mxfp8.triton_ampere import (
     TritonMxfp8LinearKernel,
 )
@@ -82,21 +86,27 @@ class DeepseekV41TritonMLAAttention(DeepseekV4FlashMLAAttention):
         # padding would only add work.
         return num_heads
 
-    def _wo_a_is_triton_mxfp8(self) -> bool:
-        # The kernel is (re)selected in process_weights_after_loading, so
-        # resolve on first forward rather than in __init__.
-        cached = getattr(self, "_wo_a_triton_mxfp8", None)
+    def _wo_a_keeps_fp8(self) -> bool:
+        # Marlin (single group) and Triton (any groups) keep wo_a in MXFP8
+        # and take the [T, G, D] input through the layer itself. Emulation
+        # dequantizes to bf16 and needs the inherited torch.bmm path. The
+        # kernel is (re)selected in process_weights_after_loading, so resolve
+        # on first forward rather than in __init__.
+        cached = getattr(self, "_wo_a_fp8", None)
         if cached is None:
             kernel = getattr(self.wo_a.quant_method, "kernel", None)
-            cached = isinstance(kernel, TritonMxfp8LinearKernel)
-            self._wo_a_triton_mxfp8 = cached
+            cached = isinstance(
+                kernel, (MarlinMxfp8LinearKernel, TritonMxfp8LinearKernel)
+            )
+            self._wo_a_fp8 = cached
         return cached
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        if not self._wo_a_is_triton_mxfp8():
+        if not self._wo_a_keeps_fp8():
             return super()._o_proj(o, positions)
-        # Inverse RoPE only (no activation quant: W8A16), then the grouped
-        # fp8 wo_a directly on the [T, G, D] view the op returns.
+        # Inverse RoPE only (no activation quant: W8A16), then wo_a on the
+        # [T, G, D] view the op returns (Marlin flattens G == 1 itself; the
+        # Triton kernel takes the groups directly).
         o_proj_input, _ = fused_inv_rope_fp8_quant(
             o,
             positions,

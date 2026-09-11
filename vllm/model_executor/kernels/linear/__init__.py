@@ -875,7 +875,10 @@ def init_mxfp8_linear_kernel(*, bmm_batch_size: int | None = None) -> Mxfp8Linea
         possible = (
             [
                 DeepGemmMxfp8BmmLinearKernel,
-                # SM 8.x: grouped fp8 GEMV instead of the bf16 dequant below.
+                # bmm_batch_size == 1 is a plain linear: Marlin (SM 8.0+)
+                # keeps it fp8 instead of the bf16 dequant of Emulation.
+                MarlinMxfp8LinearKernel,
+                # SM 8.x with real groups: grouped fp8 GEMV.
                 TritonMxfp8LinearKernel,
                 EmulationMxfp8LinearKernel,
             ]
