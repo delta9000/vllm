@@ -82,7 +82,10 @@ def _reference(x: torch.Tensor, weight, weight_scale, bias=None) -> torch.Tensor
 def _check(out: torch.Tensor, expected: torch.Tensor, name: str) -> None:
     assert out.dtype == torch.bfloat16
     assert torch.isfinite(out).all(), f"{name}: non-finite output"
-    rel = (out.float() - expected).norm() / expected.norm()
+    # float64 norms: in the extreme-magnitude case the ~1e-30 values square
+    # to ~1e-60, which underflows fp32, so the reference norm comes out as
+    # exactly 0 and the ratio is NaN even when the kernel is correct.
+    rel = (out.double() - expected.double()).norm() / expected.double().norm()
     assert rel < 4e-3, f"{name}: relative error {rel:.2e}"
     torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
 
