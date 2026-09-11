@@ -160,7 +160,12 @@ class FusedInvRopeFP8QuantKernel(
             ),
             (HEAD_DIM,),
         )
-        x_quant = tl.clamp(x / scales_exp, -fp8_max, fp8_max).to(tl.float8e4nv)
+        # Cast via the output dtype, not tl.float8e4nv: the early return above
+        # does not stop Triton from code-generating this line, and naming
+        # fp8e4nv fails to compile below SM 8.9 even when QUANTIZE is False.
+        x_quant = tl.clamp(x / scales_exp, -fp8_max, fp8_max).to(
+            out_ptr.dtype.element_ty
+        )
 
         out_base = (
             out_ptr
