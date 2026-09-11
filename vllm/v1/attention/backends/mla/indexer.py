@@ -10,6 +10,9 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.attention.dsa.mqa_logits_triton import (
+    use_triton_mqa_logits,
+)
 from vllm.model_executor.warmup.jit_warmup import kernel_launcher, zip_inputs
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     LaunchSpec,
@@ -1506,9 +1509,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if seq_lens.dim() == 1:
                 seq_lens = seq_lens.unsqueeze(-1)
 
-            # DeepGEMM is required for the paged MQA logits on CUDA devices
+            # DeepGEMM is required for the paged MQA logits on CUDA devices,
+            # except below SM 9.0, where the Triton kernels need no schedule.
             schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and has_deep_gemm():
+            if (
+                current_platform.is_cuda()
+                and has_deep_gemm()
+                and not use_triton_mqa_logits()
+            ):
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.num_states,
