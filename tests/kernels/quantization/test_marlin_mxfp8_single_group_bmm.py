@@ -54,9 +54,30 @@ def test_marlin_selected_for_single_group_bmm():
     )
 
 
+def _make_layer_uniform_scales(n: int, k: int):
+    """The fixture of test_marlin_tile_padding's MXFP8 round trip: e8m0
+    exponents in [121, 128), i.e. scales in [2^-6, 2^0]."""
+    weight = (torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / 4).to(
+        torch.float8_e4m3fn
+    )
+    scales = torch.randint(121, 128, (n, k // 32), dtype=torch.uint8, device="cuda")
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(scales, requires_grad=False)
+    layer.input_size_per_partition = k
+    layer.output_size_per_partition = n
+    return layer
+
+
+@pytest.mark.parametrize("fixture", ["quantizer", "uniform_scales"])
 @pytest.mark.parametrize("num_tokens", [1, 4, 8, 64, 4096])
 @torch.inference_mode()
-def test_marlin_single_group_matches_dequant_reference(num_tokens):
+def test_marlin_single_group_matches_dequant_reference(num_tokens, fixture):
+    """The [T, 1, K] input through the bmm kernel must equal both the same
+    Marlin kernel on the flat [T, K] input (bit for bit) and the dequantized
+    reference. Two fixtures: the MXFP8 quantizer (per-block scales) and the
+    uniform-scale one Marlin's own padding test uses -- if only ``quantizer``
+    fails, the fixture, not the wrapper, is the suspect."""
     from vllm.model_executor.kernels.linear.mxfp8.marlin import (
         MarlinMxfp8LinearKernel,
     )
@@ -65,17 +86,21 @@ def test_marlin_single_group_matches_dequant_reference(num_tokens):
     )
 
     torch.manual_seed(num_tokens)
-    layer = _make_layer(R, K)
+    make = _make_layer if fixture == "quantizer" else _make_layer_uniform_scales
+    layer = make(R, K)
     ref_w = dequant_mxfp8_to_bf16(layer.weight.data, layer.weight_scale.data).float()
     kernel = MarlinMxfp8LinearKernel(Mxfp8LinearLayerConfig(bmm_batch_size=1))
     kernel.process_weights_after_loading(layer)
-    assert layer.weight.element_size() < 2  # repacked fp8, not bf16
+    assert layer.weight.dtype == torch.int32  # Marlin's repacked fp8, not bf16
 
     x_gtk = torch.randn(1, num_tokens, K, device="cuda", dtype=torch.bfloat16)
     x = x_gtk.transpose(0, 1)  # [T, 1, K] as the inverse-RoPE op returns it
     out = kernel.apply_weights(layer, x)
     assert out.shape == (num_tokens, 1, R)
     assert out.dtype == torch.bfloat16
+    # Same kernel, plain 2-D input: the bmm view must change nothing.
+    dense = kernel.apply_weights(layer, x_gtk[0].contiguous())
+    assert torch.equal(out.view(num_tokens, R), dense), "[T, 1, K] view differs"
     expected = x_gtk[0].float() @ ref_w.T
-    rel = (out.view(num_tokens, R).float() - expected).norm() / expected.norm()
-    assert rel < 4e-3, f"relative error {rel:.2e}"
+    rel = (dense.float() - expected).norm() / expected.norm()
+    assert rel < 4e-3, f"{fixture}: relative error {rel:.2e}"

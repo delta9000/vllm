@@ -331,8 +331,12 @@ def _mxfp8_gemv_fma_kernel(
         r1 = tl.sum(tl.sum(acc1, axis=2), axis=1)
         r2 = tl.sum(tl.sum(acc2, axis=2), axis=1)
         r3 = tl.sum(tl.sum(acc3, axis=2), axis=1)
+        # tl.join stacks along a NEW last axis: join(join(a, b), join(c, d))
+        # is [BLOCK_N, 2, 2] with element [n, j, i] = (a, b, c, d)[2 * i + j],
+        # so flattening it yields a, c, b, d. Pair (r0, r2) and (r1, r3) so
+        # the flattened row order is r0, r1, r2, r3.
         res = tl.trans(
-            tl.reshape(tl.join(tl.join(r0, r1), tl.join(r2, r3)), (BLOCK_N, 4))
+            tl.reshape(tl.join(tl.join(r0, r2), tl.join(r1, r3)), (BLOCK_N, 4))
         )  # [4, BLOCK_N]
 
     out_mask = mask_m[:, None] & mask_n[None, :]
@@ -466,7 +470,10 @@ _WORKSPACE: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
 def _get_workspace(
     device: torch.device, part_elems: int, tiles: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    key = (device.index or 0, torch.cuda.current_stream(device).stream_id)
+    if device.type == "cuda":
+        key = (device.index or 0, torch.cuda.current_stream(device).stream_id)
+    else:  # TRITON_INTERPRET=1 on CPU tensors
+        key = (-1, 0)
     ws = _WORKSPACE.get(key)
     if ws is None or ws[0].numel() < part_elems or ws[1].numel() < tiles:
         part_elems = max(part_elems, ws[0].numel() if ws else 0)
