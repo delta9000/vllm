@@ -28,6 +28,12 @@ else:
     _ON_GFX942 = False
     _ON_GFX950 = False
 
+# Split-K decode (partial + reduce) rather than the single-pass kernel. At low
+# concurrency the single-pass grid is num_queries x ceil(heads / 16) programs,
+# one per query on an 8-head TP shard, each walking every selected token
+# serially; splitting the tokens fills the device.
+_SPLIT_K_DECODE = _ON_GFX942 or _ON_GFX950 or current_platform.is_cuda()
+
 logger = init_logger(__name__)
 
 FP8_DTYPE = current_platform.fp8_dtype()
@@ -2292,6 +2298,7 @@ def _sparse_attn_decode_partial_kernel(
     BLOCK_K: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     NUM_STAGES: tl.constexpr,
+    EMULATE_E4M3: tl.constexpr = False,
 ):
     query_idx = tl.program_id(0)
     split_id = tl.program_id(1)
@@ -2353,7 +2360,9 @@ def _sparse_attn_decode_partial_kernel(
             mask=valid[:, None] & nope_mask[None, :],
             other=0,
         )
-        if IS_FNUZ_MAIN:
+        if EMULATE_E4M3:
+            x_fp8 = e4m3fn_bits_to_bf16(x_uint8)
+        elif IS_FNUZ_MAIN:
             x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
         else:
             x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
@@ -2424,7 +2433,9 @@ def _sparse_attn_decode_partial_kernel(
                 mask=valid[:, None] & nope_mask[None, :],
                 other=0,
             )
-            if IS_FNUZ_EXTRA:
+            if EMULATE_E4M3:
+                x_fp8 = e4m3fn_bits_to_bf16(x_uint8)
+            elif IS_FNUZ_EXTRA:
                 x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
             else:
                 x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
@@ -3399,8 +3410,9 @@ def _rocm_sparse_attn_decode_ragged_triton(
     nope_block = triton.next_power_of_2(nope_head_dim)
     comb_dim = nope_head_dim + rope_head_dim
     is_fnuz = current_platform.is_fp8_fnuz()
+    emulate_e4m3 = not is_fnuz and needs_e4m3fn_emulation()
 
-    if not (_ON_GFX942 or _ON_GFX950):  # Fallback path for un-tuned architectures.
+    if not _SPLIT_K_DECODE:  # Fallback path for un-tuned architectures.
         block_k = 16 if head_dim >= 256 else 32
         _sparse_attn_decode_ragged_kernel[(num_queries, heads_blocks)](
             q,
@@ -3433,7 +3445,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             IS_FNUZ_EXTRA=False,
             BLOCK_H=block_h,
             BLOCK_K=block_k,
-            EMULATE_E4M3=not is_fnuz and needs_e4m3fn_emulation(),
+            EMULATE_E4M3=emulate_e4m3,
             num_warps=8,
         )
         return out
@@ -3560,6 +3572,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             BLOCK_K=block_k,
             NUM_SPLITS=num_splits,
             NUM_STAGES=1,
+            EMULATE_E4M3=emulate_e4m3,
             num_warps=4,
         )
 
