@@ -3,9 +3,143 @@
 
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
-from vllm.triton_utils import triton
+from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
+
+# Largest topk_ids.numel() the single-CTA Triton path handles (decode).
+SMALL_ALIGN_MAX_NUMEL = 128
+SMALL_ALIGN_MAX_EXPERTS = 1024
+
+
+@triton.jit
+def _moe_align_small_kernel(
+    topk_ids_ptr,  # [numel] int32/int64 global expert ids
+    expert_map_ptr,  # [num_global_experts] int32, or unused
+    sorted_ids_ptr,  # [max_padded] int32 out
+    expert_ids_ptr,  # [num_blocks] int32 out
+    num_post_pad_ptr,  # [1] int32 out
+    numel,
+    num_experts,
+    max_padded,
+    num_blocks,
+    block_size,
+    BLOCK_T: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    MAX_EXPERT_BLOCKS: tl.constexpr,
+    HAS_MAP: tl.constexpr,
+):
+    """One CTA does the whole alignment for a decode-sized batch.
+
+    Same contract as ``_moe_C.moe_align_block_size`` with
+    ``ignore_invalid_experts=True``: entries whose expert is not local
+    (``expert_map == -1``) are dropped, tokens are grouped by (local) expert
+    in stable order, each group is padded to ``block_size`` with the
+    sentinel ``numel``, ``expert_ids`` names each block's expert (-1 past the
+    end) and ``num_post_pad`` is the padded total. All outputs are
+    initialised here, so no host-side fills or scans are needed.
+    """
+    t = tl.arange(0, BLOCK_T)
+    tmask = t < numel
+    e = tl.load(topk_ids_ptr + t, mask=tmask, other=-1).to(tl.int32)
+    if HAS_MAP:
+        e = tl.load(expert_map_ptr + e, mask=tmask & (e >= 0), other=-1).to(tl.int32)
+    valid = tmask & (e >= 0) & (e < num_experts)
+    e_safe = tl.where(valid, e, 0)
+
+    # Per-expert counts: histogram of the valid entries; the invalid ones were
+    # sent to bin 0 and are subtracted back out.
+    ex = tl.arange(0, BLOCK_E)
+    cnt = tl.histogram(e_safe, BLOCK_E)
+    n_invalid = tl.sum(tl.where(valid, 0, 1).to(tl.int32), axis=0)
+    cnt = cnt - tl.where(ex == 0, n_invalid, 0)
+    padded = ((cnt + block_size - 1) // block_size) * block_size
+    offs = tl.cumsum(padded, axis=0) - padded  # exclusive
+    total = tl.sum(padded, axis=0)
+
+    # Stable rank of each entry within its expert group.
+    same = valid[:, None] & valid[None, :] & (e_safe[:, None] == e_safe[None, :])
+    before = t[None, :] < t[:, None]
+    rank = tl.sum((same & before).to(tl.int32), axis=1)
+    pos = tl.gather(offs, e_safe, 0) + rank
+
+    # Initialise the outputs, then scatter the real entries over them.
+    for s0 in range(0, max_padded, BLOCK_S):
+        s = s0 + tl.arange(0, BLOCK_S)
+        tl.store(
+            sorted_ids_ptr + s,
+            tl.full((BLOCK_S,), 0, tl.int32) + numel,
+            mask=s < max_padded,
+        )
+    b = tl.arange(0, BLOCK_S)
+    for b0 in range(0, num_blocks, BLOCK_S):
+        bb = b0 + b
+        tl.store(
+            expert_ids_ptr + bb, tl.full((BLOCK_S,), -1, tl.int32), mask=bb < num_blocks
+        )
+    tl.debug_barrier()
+    tl.store(sorted_ids_ptr + pos, t, mask=valid)
+    first_block = offs // block_size
+    n_expert_blocks = padded // block_size
+    for j in tl.static_range(MAX_EXPERT_BLOCKS):
+        tl.store(
+            expert_ids_ptr + first_block + j,
+            ex,
+            mask=(j < n_expert_blocks) & (ex < num_experts),
+        )
+    tl.store(num_post_pad_ptr + tl.arange(0, 1), tl.full((1,), 0, tl.int32) + total)
+
+
+def _use_small_align(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    expert_map: torch.Tensor | None,
+    ignore_invalid_experts: bool,
+) -> bool:
+    return (
+        envs.VLLM_MOE_ALIGN_SMALL
+        and (current_platform.is_cuda() or topk_ids.device.type == "cpu")
+        and topk_ids.numel() <= SMALL_ALIGN_MAX_NUMEL
+        and 0 < num_experts <= SMALL_ALIGN_MAX_EXPERTS
+        and topk_ids.dtype in (torch.int32, torch.int64)
+        and (expert_map is None or ignore_invalid_experts)
+    )
+
+
+def moe_align_block_size_small(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    expert_map: torch.Tensor | None,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+) -> None:
+    numel = topk_ids.numel()
+    topk_flat = topk_ids.reshape(-1)
+    if not topk_flat.is_contiguous():
+        topk_flat = topk_flat.contiguous()
+    _moe_align_small_kernel[(1,)](
+        topk_flat,
+        expert_map if expert_map is not None else topk_flat,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        numel,
+        num_experts,
+        sorted_ids.numel(),
+        expert_ids.numel(),
+        block_size,
+        BLOCK_T=max(16, triton.next_power_of_2(numel)),
+        BLOCK_E=max(16, triton.next_power_of_2(num_experts)),
+        BLOCK_S=128,
+        MAX_EXPERT_BLOCKS=triton.cdiv(numel, block_size),
+        HAS_MAP=expert_map is not None,
+        num_warps=4,
+    )
 
 
 def moe_align_block_size(
@@ -86,6 +220,20 @@ def moe_align_block_size(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
+
+    if _use_small_align(topk_ids, num_experts, expert_map, ignore_invalid_experts):
+        # Decode: one Triton CTA replaces the CUDA op's fills, cub scans and
+        # alignment kernel (6 launches per MoE layer) with a single launch.
+        moe_align_block_size_small(
+            topk_ids,
+            block_size,
+            num_experts,
+            expert_map,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+        )
+        return sorted_ids, expert_ids, num_tokens_post_pad
 
     ops.moe_align_block_size(
         topk_ids,
