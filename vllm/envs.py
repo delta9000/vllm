@@ -61,7 +61,7 @@ if TYPE_CHECKING:
     VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR: int = 40
     VLLM_DSV4_FUSED_MHC: bool = True
     VLLM_MHC_TRITON_PRENORM: bool = False
-    VLLM_MOE_ALIGN_SMALL: bool = True
+    VLLM_MOE_ALIGN_SMALL: bool = False
     VLLM_TRITON_GATE_GEMM: bool = True
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
@@ -1113,8 +1113,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MHC_TRITON_PRENORM": lambda: os.getenv("VLLM_MHC_TRITON_PRENORM", "0")
     == "1",
     # moe_align_block_size on one Triton CTA for <= 128 (token, expert) pairs
-    # instead of the CUDA op's fills + cub scans + align kernels.
-    "VLLM_MOE_ALIGN_SMALL": lambda: os.getenv("VLLM_MOE_ALIGN_SMALL", "1") == "1",
+    # instead of the CUDA op's fills + cub scans + align kernels. Off: it does
+    # collapse the launches (2 -> 1) but the single CTA is slower than the two
+    # it replaces (5.8 vs 5.4 us at the V4.1 decode shape), and at decode the
+    # whole step is inside a CUDA graph, so the launches it saves cost no CPU
+    # time. Worth revisiting for a shape where the CUDA op's scans dominate.
+    "VLLM_MOE_ALIGN_SMALL": lambda: os.getenv("VLLM_MOE_ALIGN_SMALL", "0") == "1",
     # MoE router gate at M <= 16 as one Triton split-K GEMM instead of cuBLAS
     # gemm + splitKreduce.
     "VLLM_TRITON_GATE_GEMM": lambda: os.getenv("VLLM_TRITON_GATE_GEMM", "1") == "1",
