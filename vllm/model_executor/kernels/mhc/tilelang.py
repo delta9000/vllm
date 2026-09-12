@@ -2,13 +2,26 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm import envs
 from vllm.utils.torch_utils import direct_register_custom_op
 
-# Token counts above this use the Triton pre-norm GEMM (no DeepGEMM) and,
-# for the fused post+pre op, the separate post kernel instead of the
-# single-CTA-per-token fused FMA kernel.
+# Above this many tokens the fused post+pre op uses the separate post kernel
+# instead of the single-CTA-per-token fused FMA kernel.
 TRITON_PRENORM_MIN_TOKENS = 16
+# K-splits for the Triton pre-norm GEMM. That kernel is off by default: on A40
+# it loses to the TileLang projections at every token count measured
+# (dev/tools/sweep_prenorm.py, 17..4096 tokens: 0.04x at 17, 0.92x at its best
+# T=512, 0.40x at 4096), despite tiling 32 tokens and splitting K. Set
+# VLLM_MHC_TRITON_PRENORM=1 to re-measure it on another part.
 TRITON_PRENORM_SPLITS = 4
+
+
+def _use_triton_prenorm(num_tokens: int, device: torch.device) -> bool:
+    return (
+        envs.VLLM_MHC_TRITON_PRENORM
+        and num_tokens > TRITON_PRENORM_MIN_TOKENS
+        and device.type == "cuda"
+    )
 
 
 def _prenorm_num_splits(num_tokens: int, use_deep_gemm: bool, input_size: int) -> int:
@@ -17,7 +30,9 @@ def _prenorm_num_splits(num_tokens: int, use_deep_gemm: bool, input_size: int) -
         from vllm.model_executor.kernels.mhc.warmup import compute_mhc_pre_num_splits
 
         return compute_mhc_pre_num_splits(input_size, num_tokens)
-    return TRITON_PRENORM_SPLITS if num_tokens > TRITON_PRENORM_MIN_TOKENS else 1
+    if _use_triton_prenorm(num_tokens, torch.device("cuda")):
+        return TRITON_PRENORM_SPLITS
+    return 1
 
 
 def _torch_hc_prenorm_gemm(
@@ -52,10 +67,11 @@ def _tilelang_hc_prenorm_gemm(
     assert out.shape[0] == n_splits
     assert sqrsum.shape[0] == n_splits
     assert x.shape[1] == hc_mult * hidden_size
-    if x.shape[0] > TRITON_PRENORM_MIN_TOKENS and x.device.type == "cuda":
+    if _use_triton_prenorm(x.shape[0], x.device):
         # Above decode sizes the TileLang kernels either run 2 CTAs per token
         # (n_thr=1024 config) or re-read the whole fn per token pair
-        # (block_m=2): the Triton GEMM tiles 32 tokens and splits K.
+        # (block_m=2); the Triton GEMM tiles 32 tokens and splits K instead.
+        # That trade does not pay off on A40 -- see TRITON_PRENORM_SPLITS.
         from vllm.model_executor.kernels.mhc.triton_prenorm_gemm import (
             hc_prenorm_gemm_triton,
         )

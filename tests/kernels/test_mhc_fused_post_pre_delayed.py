@@ -10,6 +10,9 @@ plumbing (argument order, split-K reduction, pre-mix carry) with torch
 stand-ins for the TileLang kernels, so it runs without a GPU.
 """
 
+import contextlib
+import os
+
 import pytest
 import torch
 
@@ -18,6 +21,20 @@ from vllm.model_executor.kernels.mhc.torch import (
     mhc_pre_delayed_torch,
 )
 from vllm.platforms import current_platform
+
+
+@contextlib.contextmanager
+def monkeypatch_env(name, value):
+    """vllm.envs re-reads os.environ on every attribute access."""
+    prev = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if prev is None:
+            del os.environ[name]
+        else:
+            os.environ[name] = prev
 
 HC, HIDDEN = 4, 5120
 MIX = HC * (HC + 2)
@@ -153,11 +170,19 @@ def test_triton_prenorm_gemm(num_tokens):
     ref_sq = x.float().square().sum(-1)
     torch.testing.assert_close(out.sum(0), ref, rtol=1e-4, atol=1e-3)
     torch.testing.assert_close(sq.sum(0), ref_sq, rtol=1e-5, atol=1e-2)
-    # The dispatcher routes tokens > 16 here.
-    out2 = torch.empty(SPLIT_K, num_tokens, MIX, device="cuda")
-    sq2 = torch.empty(SPLIT_K, num_tokens, device="cuda")
-    _tilelang_hc_prenorm_gemm(x, fn, out2, sq2, HC * HIDDEN, 1, n_splits=SPLIT_K)
-    assert torch.equal(out, out2) and torch.equal(sq, sq2)
+    # The dispatcher reaches this kernel only under VLLM_MHC_TRITON_PRENORM,
+    # which is off by default (it loses to TileLang at every measured token
+    # count on A40). With it on, tokens > 16 route here bit-for-bit.
+    with monkeypatch_env("VLLM_MHC_TRITON_PRENORM", "1"):
+        out2 = torch.empty(SPLIT_K, num_tokens, MIX, device="cuda")
+        sq2 = torch.empty(SPLIT_K, num_tokens, device="cuda")
+        _tilelang_hc_prenorm_gemm(x, fn, out2, sq2, HC * HIDDEN, 1, n_splits=SPLIT_K)
+        assert torch.equal(out, out2) and torch.equal(sq, sq2)
+    # Off (the default) it must not: the TileLang kernels fill one split.
+    out3 = torch.empty(1, num_tokens, MIX, device="cuda")
+    sq3 = torch.empty(1, num_tokens, device="cuda")
+    _tilelang_hc_prenorm_gemm(x, fn, out3, sq3, HC * HIDDEN, 1, n_splits=1)
+    torch.testing.assert_close(out3[0], ref, rtol=1e-4, atol=1e-3)
 
 
 @torch.inference_mode()

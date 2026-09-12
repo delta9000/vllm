@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR: int = 40
     VLLM_DSV4_FUSED_MHC: bool = True
+    VLLM_MHC_TRITON_PRENORM: bool = False
     VLLM_MOE_ALIGN_SMALL: bool = True
     VLLM_TRITON_GATE_GEMM: bool = True
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
@@ -1103,10 +1104,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Launch-tail fusions for DeepSeek V4.1 decode on GPUs without DeepGEMM /
     # specialised router kernels. Each can be switched off on its own to A/B
     # it against the unfused path.
-    # mHC: fused post + delayed-pre op (one launch fewer per sublayer, and the
-    # Triton pre-norm GEMM above 16 tokens) instead of post, prenorm GEMM and
-    # coefficient kernels as three ops.
+    # mHC: fused post + delayed-pre op (one launch fewer per sublayer) instead
+    # of post, prenorm GEMM and coefficient kernels as three ops.
     "VLLM_DSV4_FUSED_MHC": lambda: os.getenv("VLLM_DSV4_FUSED_MHC", "1") == "1",
+    # mHC pre-norm projection above 16 tokens as a Triton tl.dot GEMM instead
+    # of the TileLang kernels. Off: measured a loss at every token count on
+    # A40 (see TRITON_PRENORM_SPLITS in kernels/mhc/tilelang.py).
+    "VLLM_MHC_TRITON_PRENORM": lambda: os.getenv("VLLM_MHC_TRITON_PRENORM", "0")
+    == "1",
     # moe_align_block_size on one Triton CTA for <= 128 (token, expert) pairs
     # instead of the CUDA op's fills + cub scans + align kernels.
     "VLLM_MOE_ALIGN_SMALL": lambda: os.getenv("VLLM_MOE_ALIGN_SMALL", "1") == "1",
