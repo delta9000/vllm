@@ -4,7 +4,11 @@ import torch
 from torch.nn.parameter import Parameter
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.layers.fused_moe.router.triton_gate_gemm import (
+    MAX_M as TRITON_GATE_MAX_M,
+)
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -117,6 +121,20 @@ class GateLinear(ReplicatedLinear):
             and self.weight.dtype == torch.bfloat16
             and self.out_dtype == torch.float32
         )
+        # Tier 3b: single-launch Triton GEMM for decode-sized M on CUDA GPUs
+        # without a specialised router kernel (cuBLAS runs split-K plus a
+        # separate reduce kernel there).
+        self._triton_small_m_capable = (
+            envs.VLLM_TRITON_GATE_GEMM
+            and current_platform.is_cuda()
+            and not can_use_specialized_kernels
+            and not bias
+        )
+        self.allow_triton_small_m_gemm = (
+            self._triton_small_m_capable
+            and self.weight.dtype == torch.bfloat16
+            and self.out_dtype == torch.float32
+        )
 
         # cuteDSL ll_bf16_gemm eligibility. Any dims supported, but SM90+ required bc:
         # 1. PDL support. Both dot-product and split-K kernels.
@@ -149,6 +167,8 @@ class GateLinear(ReplicatedLinear):
             and out_dtype == torch.float32
         ):
             self.allow_cublas_router_gemm = self.weight.dtype == torch.bfloat16
+        if self._triton_small_m_capable and out_dtype == torch.float32:
+            self.allow_triton_small_m_gemm = self.weight.dtype == torch.bfloat16
 
         # out_dtype may start as None -> recompute eligibility here
         if self.allow_specialized_router_gemm:
@@ -193,6 +213,17 @@ class GateLinear(ReplicatedLinear):
             )
 
             output = bf16x3_router_gemm(x, self.weight)
+            return output, None
+
+        # Tier 3b: Triton single-launch GEMM at decode sizes (no specialised
+        # kernels on this GPU; cuBLAS would add a splitKreduce launch).
+        if (
+            self.allow_triton_small_m_gemm
+            and x.dtype == torch.bfloat16
+            and x.shape[0] <= TRITON_GATE_MAX_M
+            and x.shape[1] % 8 == 0
+        ):
+            output = torch.ops.vllm.triton_gate_gemm(x, self.weight)
             return output, None
 
         # Tier 4: cuBLAS bf16→fp32
