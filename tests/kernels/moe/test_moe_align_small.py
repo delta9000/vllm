@@ -9,6 +9,8 @@ test_moe_align_block_size, and the CUDA op itself when available), with and
 without an expert-parallel ``expert_map``.
 """
 
+import os
+
 import pytest
 import torch
 
@@ -16,6 +18,20 @@ from vllm.model_executor.layers.fused_moe import moe_align_block_size as mab
 from vllm.platforms import current_platform
 
 from .test_moe_align_block_size import torch_moe_align_block_size
+
+
+@pytest.fixture(autouse=True)
+def small_align_on():
+    """The path is off by default (a wash on A40); these tests exercise it."""
+    prev = os.environ.get("VLLM_MOE_ALIGN_SMALL")
+    os.environ["VLLM_MOE_ALIGN_SMALL"] = "1"
+    try:
+        yield
+    finally:
+        if prev is None:
+            del os.environ["VLLM_MOE_ALIGN_SMALL"]
+        else:
+            os.environ["VLLM_MOE_ALIGN_SMALL"] = prev
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda(), reason="Triton moe_align is CUDA-only"
