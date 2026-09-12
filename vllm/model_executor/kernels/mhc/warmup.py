@@ -43,16 +43,21 @@ class MHCPreNormKernel(VllmJitKernel["MHCPreNormKernel.CompileKey"]):
 
     def get_warmup_keys(self, *, max_tokens: int, **fields) -> list[CompileKey]:
         # The split heuristic changes only at 64-token boundaries.
-        splits = (
-            sorted(
+        if is_deep_gemm_supported():
+            splits = sorted(
                 {
                     compute_mhc_pre_num_splits(fields["rms_numel"], num_tokens)
                     for num_tokens in range(1, max_tokens + 1, 64)
                 }
             )
-            if is_deep_gemm_supported()
-            else [1]
-        )
+        else:
+            # No DeepGEMM: 1 for the plain pre kernels, 4/8 for the fused
+            # post+pre FMA kernel at decode and the Triton GEMM above it.
+            from vllm.model_executor.kernels.mhc.tilelang import (
+                TRITON_PRENORM_SPLITS,
+            )
+
+            splits = sorted({1, 4, 8, TRITON_PRENORM_SPLITS})
         return self._trace_dispatch(self.dispatch)(n_splits=splits, **fields)
 
     def compile(self, compile_key: CompileKey) -> None:
