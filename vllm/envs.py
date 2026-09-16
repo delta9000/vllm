@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR: int = 40
+    VLLM_DSA_SPARSE_DECODE: bool = False
     VLLM_MOE_ALIGN_SMALL: bool = False
     VLLM_TRITON_GATE_GEMM: bool = True
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
@@ -1102,6 +1103,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Launch-tail fusions for DeepSeek V4.1 decode on GPUs without DeepGEMM /
     # specialised router kernels. Each can be switched off on its own to A/B
     # it against the unfused path.
+    # V4.1 two-level indexer: score only the candidate blocks on decode
+    # instead of scoring every KV position and masking down to them.
+    "VLLM_DSA_SPARSE_DECODE": lambda: os.getenv("VLLM_DSA_SPARSE_DECODE", "0") == "1",
     # moe_align_block_size on one Triton CTA for <= 128 (token, expert) pairs
     # instead of the CUDA op's fills + cub scans + align kernels. Off: it does
     # collapse the launches (2 -> 1) but the single CTA is slower than the two

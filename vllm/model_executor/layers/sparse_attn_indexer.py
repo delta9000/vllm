@@ -25,6 +25,11 @@ from vllm.model_executor.kernels.attention.dsa.mqa_logits_triton import (
     fp8_paged_mqa_logits_triton,
     use_triton_mqa_logits,
 )
+from vllm.model_executor.kernels.attention.dsa.sparse_mqa_logits_triton import (
+    sort_candidate_blocks,
+    sparse_paged_mqa_logits_triton,
+    sparse_topk_remap,
+)
 from vllm.model_executor.layers.indexer_topk import (
     RADIX_TOPK_WORKSPACE_SIZE,
     get_indexer_topk,
@@ -620,6 +625,8 @@ def sparse_attn_indexer(
                             candidate_block_size,
                             chunk_candidates,
                         )
+                        if envs.VLLM_DSA_SPARSE_DECODE:
+                            sort_candidate_blocks(chunk_candidates)
                     else:
                         _apply_candidate_mask(
                             logits,
@@ -719,6 +726,19 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
+        # v4.1 two-level indexer: score only the candidate blocks instead of
+        # scoring every KV position and masking down to them. At a 512k context
+        # that is 16384 columns instead of 524288 (see
+        # kernels/attention/dsa/sparse_mqa_logits_triton.py).
+        sparse_rows = padded_q_quant_cast.shape[0] * padded_q_quant_cast.shape[1]
+        use_sparse_decode = (
+            envs.VLLM_DSA_SPARSE_DECODE
+            and candidate_blocks is not None
+            and not candidate_write
+            and padded_q_scale is None
+            and use_triton_mqa_logits()
+            and decode_metadata.global_seq_lens is None
+        )
         if current_platform.is_xpu():
             if padded_q_scale is not None:
                 raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
@@ -736,14 +756,26 @@ def sparse_attn_indexer(
             )
         elif use_triton_mqa_logits():
             assert padded_q_scale is None, "Triton MQA logits are FP8-only"
-            logits = fp8_paged_mqa_logits_triton(
-                padded_q_quant_cast,
-                kv_cache,
-                weights[:num_padded_tokens],
-                seq_lens,
-                decode_metadata.block_table,
-                max_model_len,
-            )
+            if use_sparse_decode:
+                # Columns are compressed candidate positions, not KV positions.
+                logits = sparse_paged_mqa_logits_triton(
+                    padded_q_quant_cast,
+                    kv_cache,
+                    weights[:num_padded_tokens],
+                    seq_lens,
+                    decode_metadata.block_table,
+                    candidate_blocks[:sparse_rows],
+                    candidate_block_size,
+                )
+            else:
+                logits = fp8_paged_mqa_logits_triton(
+                    padded_q_quant_cast,
+                    kv_cache,
+                    weights[:num_padded_tokens],
+                    seq_lens,
+                    decode_metadata.block_table,
+                    max_model_len,
+                )
         else:
             logits = fp8_fp4_paged_mqa_logits(
                 (padded_q_quant_cast, padded_q_scale),
@@ -756,8 +788,8 @@ def sparse_attn_indexer(
                 clean_logits=False,
                 indices=decode_metadata.indices,
             )
-        num_rows = logits.shape[0]
-        if candidate_blocks is not None:
+        num_rows = sparse_rows if use_sparse_decode else logits.shape[0]
+        if candidate_blocks is not None and not use_sparse_decode:
             # Two-level selection (v4.1) on the decode logits; columns are
             # request-local compressed positions. seq_lens is (B, next_n)
             # for native spec decode (per-row effective lens) and (B, 1)
@@ -776,6 +808,10 @@ def sparse_attn_indexer(
                     decode_candidates,
                     row_repeat,
                 )
+                if envs.VLLM_DSA_SPARSE_DECODE:
+                    # Sorted candidates make the sparse kernel gathers local; one
+                    # sort here is reused by every consumer layer (24/28/32/36).
+                    sort_candidate_blocks(decode_candidates)
             else:
                 _apply_candidate_mask(
                     logits,
@@ -787,16 +823,27 @@ def sparse_attn_indexer(
                 )
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        # The backend comes from the layer (config is only readable at model
-        # construction); dispatchers are cached per backend.
-        get_indexer_topk(topk_backend)(
-            logits,
-            seq_lens,
-            next_n,
-            topk_indices,
-            topk_tokens,
-            attn_metadata_narrowed.max_seq_len,
-        )
+        if use_sparse_decode:
+            # Top-k over the compressed row, then map the chosen columns back
+            # to request-local positions.
+            sparse_topk_remap(
+                logits,
+                candidate_blocks[:num_rows],
+                candidate_block_size,
+                topk_tokens,
+                topk_indices,
+            )
+        else:
+            # The backend comes from the layer (config is only readable at
+            # model construction); dispatchers are cached per backend.
+            get_indexer_topk(topk_backend)(
+                logits,
+                seq_lens,
+                next_n,
+                topk_indices,
+                topk_tokens,
+                attn_metadata_narrowed.max_seq_len,
+            )
 
         if decode_metadata.global_seq_lens is not None:
             _merge_dcp_topk_global(
