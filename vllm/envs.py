@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR: int = 40
+    VLLM_DSA_SPARSE_DECODE: bool = False
     VLLM_DSV4_FUSED_MHC: bool = True
     VLLM_MHC_TRITON_PRENORM: bool = False
     VLLM_MOE_ALIGN_SMALL: bool = False
@@ -1106,6 +1107,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # it against the unfused path.
     # mHC: fused post + delayed-pre op (one launch fewer per sublayer) instead
     # of post, prenorm GEMM and coefficient kernels as three ops.
+    # V4.1 two-level indexer: score only the candidate blocks on decode
+    # instead of scoring every KV position and masking down to them.
+    "VLLM_DSA_SPARSE_DECODE": lambda: os.getenv("VLLM_DSA_SPARSE_DECODE", "0") == "1",
     "VLLM_DSV4_FUSED_MHC": lambda: os.getenv("VLLM_DSV4_FUSED_MHC", "1") == "1",
     # mHC pre-norm projection above 16 tokens as a Triton tl.dot GEMM instead
     # of the TileLang kernels. Off: measured a loss at every token count on
