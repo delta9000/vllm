@@ -1187,6 +1187,20 @@ class DeepseekV41LLMForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
+        if logits is not None and envs.VLLM_DSV41_DECODE_BLACKLIST:
+            # BOS, PAD and the image sentinels are never valid output, and a
+            # sampled 129264 would be fed back as an image placeholder. Same
+            # ids DeepSeek's eval harness bans (DeepInfer --decode-blacklist).
+            banned = getattr(self, "_banned_token_ids", None)
+            if banned is None or banned.device != logits.device:
+                ids = [
+                    int(t)
+                    for t in envs.VLLM_DSV41_DECODE_BLACKLIST.split(",")
+                    if t.strip() and int(t) < logits.shape[-1]
+                ]
+                banned = torch.tensor(ids, dtype=torch.long, device=logits.device)
+                self._banned_token_ids = banned
+            logits.index_fill_(-1, banned, float("-inf"))
         return logits
 
     def compute_logits_local(

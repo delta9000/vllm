@@ -63,6 +63,8 @@ if TYPE_CHECKING:
     VLLM_DSA_SPARSE_DECODE: bool = False
     VLLM_MOE_ALIGN_SMALL: bool = False
     VLLM_TRITON_GATE_GEMM: bool = True
+    VLLM_DSV41_DECODE_BLACKLIST: str = "0,2,129262,129263,129264"
+    VLLM_DSV41_WO_A_ACT_QUANT: bool = False
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -1116,6 +1118,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MoE router gate at M <= 16 as one Triton split-K GEMM instead of cuBLAS
     # gemm + splitKreduce.
     "VLLM_TRITON_GATE_GEMM": lambda: os.getenv("VLLM_TRITON_GATE_GEMM", "1") == "1",
+    # Comma-separated token ids DeepSeek V4.1 may never generate (target
+    # logits are set to -inf). Empty disables. Default: BOS, PAD, image tokens.
+    "VLLM_DSV41_DECODE_BLACKLIST": lambda: os.getenv(
+        "VLLM_DSV41_DECODE_BLACKLIST", "0,2,129262,129263,129264"
+    ),
+    # Round the attention output to MXFP8 (e4m3, ue8m0 per 32) and back before
+    # wo_a on SM 8.x, as the 1017 reference does (inference/model.py:787). The
+    # W8A16 path is otherwise more precise than the reference; this exists to
+    # A/B numerics against it.
+    "VLLM_DSV41_WO_A_ACT_QUANT": lambda: os.getenv(
+        "VLLM_DSV41_WO_A_ACT_QUANT", "0"
+    )
+    == "1",
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.
     # Raise it for long-context deployments, where step cost is dominated by

@@ -19,7 +19,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
+import vllm.envs as envs
 from vllm.models.deepseek_v41.common.ops import compute_global_topk_indices_and_lens
+from vllm.models.deepseek_v41.common.ops.mxfp8_qdq import mxfp8_qdq_
 from vllm.model_executor.kernels.linear.mxfp8.marlin import (
     MarlinMxfp8LinearKernel,
 )
@@ -126,6 +128,8 @@ class DeepseekV41TritonMLAAttention(DeepseekV4FlashMLAAttention):
             tma_aligned_scales=False,
             quantize=False,
         )
+        if envs.VLLM_DSV41_WO_A_ACT_QUANT:
+            mxfp8_qdq_(o_proj_input)
         z = self.wo_a(o_proj_input)  # [T, G, o_lora_rank]
         return self.wo_b(z.flatten(1))
 
