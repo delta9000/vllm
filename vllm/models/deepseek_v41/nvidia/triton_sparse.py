@@ -33,6 +33,7 @@ from vllm.models.deepseek_v41.sparse_mla import (
     DeepseekV41SparseSWAMetadataBuilder,
 )
 from vllm.platforms.interface import DeviceCapability
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_sparse_attn_decode as triton_sparse_attn_decode,
@@ -42,7 +43,9 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
 )
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+    from vllm.v1.kv_cache_interface import KVCacheSpec
 
 
 class DeepseekV41TritonMLASparseBackend(DeepseekV4FlashMLABackend):
@@ -55,10 +58,26 @@ class DeepseekV41TritonMLASparseBackend(DeepseekV4FlashMLABackend):
         return capability.major == 8
 
 
+class DeepseekSparseSWATritonMetadataBuilder(DeepseekV41SparseSWAMetadataBuilder):
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: "VllmConfig",
+        kv_cache_spec: "KVCacheSpec",
+    ) -> AttentionCGSupport:
+        spec_config = vllm_config.speculative_config
+        if spec_config is not None and spec_config.enable_adaptive_verification:
+            # The Triton decode reads per-token SWA indices and lengths that the
+            # builder derives from device query boundaries, so varlen decode
+            # graphs are safe (as on FlashMLA's SWA builder and ROCm's).
+            return AttentionCGSupport.ALWAYS
+        return super().get_cudagraph_support(vllm_config, kv_cache_spec)
+
+
 class DeepseekSparseSWATritonBackend(DeepseekSparseSWABackend):
     @staticmethod
-    def get_builder_cls() -> type[DeepseekV41SparseSWAMetadataBuilder]:
-        return DeepseekV41SparseSWAMetadataBuilder
+    def get_builder_cls() -> type[DeepseekSparseSWATritonMetadataBuilder]:
+        return DeepseekSparseSWATritonMetadataBuilder
 
 
 class DeepseekV41TritonMLAAttention(DeepseekV4FlashMLAAttention):

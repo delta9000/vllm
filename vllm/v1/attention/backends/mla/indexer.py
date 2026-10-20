@@ -257,6 +257,15 @@ class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
 
 
 class DeepseekV41IndexerBackend(DeepseekV4IndexerBackend):
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        # SM 8.x runs adaptive verification through the per-token flattened
+        # Triton indexer path, which takes row ownership from device lengths.
+        return (
+            _sm8x_supports_flattened_device_query_lens()
+            or super().supports_device_cpu_query_lens_mismatch()
+        )
+
     @staticmethod
     def get_name() -> str:
         return "DEEPSEEK_V41_INDEXER"
@@ -759,6 +768,22 @@ def _supports_flattened_device_query_lens() -> bool:
     )
 
 
+def _sm8x_supports_flattened_device_query_lens(
+    vllm_config: VllmConfig | None = None,
+) -> bool:
+    """SM 8.x has no DeepGEMM; its Triton indexer flattens every decode query
+    into a single-token row built from device metadata (V4.1 only)."""
+    if not (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(80)
+    ):
+        return False
+    model_config = vllm_config.model_config if vllm_config is not None else None
+    return model_config is None or (
+        "DeepseekV41ForCausalLM" in model_config.architectures
+    )
+
+
 def _supports_native_decode(next_n: int) -> bool:
     """Whether decode can pass `next_n` Q rows per request to the kernel
     instead of flattening to one single-token row per query, which re-reads
@@ -779,7 +804,10 @@ def _use_flattening(vllm_config: VllmConfig) -> bool:
     return not _supports_native_decode(next_n) or (
         speculative_config is not None
         and speculative_config.enable_adaptive_verification
-        and _supports_flattened_device_query_lens()
+        and (
+            _supports_flattened_device_query_lens()
+            or _sm8x_supports_flattened_device_query_lens(vllm_config)
+        )
     )
 
 

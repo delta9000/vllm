@@ -1768,6 +1768,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.kv_cache_config.num_blocks,
                     self.max_model_len,
                     input_block_tables=block_tables,
+                    vocab_size=self.vocab_size,
                 )
 
         attn_metadata = None

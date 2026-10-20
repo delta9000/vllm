@@ -220,8 +220,16 @@ def set_dummy_context(
     num_kv_blocks: int,
     max_model_len: int,
     input_block_tables: Sequence[torch.Tensor] | None = None,
+    vocab_size: int | None = None,
 ) -> None:
     """Give each dummy request context_len of context, used when profiling step cost."""
+    if vocab_size:
+        # All-zero ids send every token to the same experts (and engram rows),
+        # which flattens the verify-cost curve so the budget never trims. Draw
+        # them from one fixed seed so every TP rank profiles identically.
+        gen = torch.Generator(device=input_batch.input_ids.device)
+        gen.manual_seed(0)
+        input_batch.input_ids.random_(3, vocab_size, generator=gen)
     if input_block_tables is None:
         input_block_tables = block_tables.input_block_tables
     if not input_block_tables:
