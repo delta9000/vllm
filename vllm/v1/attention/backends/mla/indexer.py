@@ -789,6 +789,15 @@ def _supports_native_decode(next_n: int) -> bool:
     instead of flattening to one single-token row per query, which re-reads
     the KV tile once per row.
     """
+    if (
+        current_platform.is_cuda()
+        and not current_platform.has_device_capability(90)
+        and envs.VLLM_DSA_GROUPED_DECODE
+    ):
+        # Below SM 9.0 the Triton paged decode kernels take any next_n with
+        # per-token context lengths, and the dense one shares each request's
+        # K tile across its next_n rows (mqa_logits_triton.py).
+        return True
     if not (current_platform.is_cuda() and has_deep_gemm()):
         return next_n in (1, 2)
     if current_platform.is_device_capability_family(100):

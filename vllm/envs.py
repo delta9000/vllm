@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR: int = 40
     VLLM_DSA_SPARSE_DECODE: bool = False
+    VLLM_DSA_GROUPED_DECODE: bool = True
     VLLM_MOE_ALIGN_SMALL: bool = False
     VLLM_TRITON_GATE_GEMM: bool = True
     VLLM_DSV41_DECODE_BLACKLIST: str = "0,2,129262,129263,129264"
@@ -1108,6 +1109,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # V4.1 two-level indexer: score only the candidate blocks on decode
     # instead of scoring every KV position and masking down to them.
     "VLLM_DSA_SPARSE_DECODE": lambda: os.getenv("VLLM_DSA_SPARSE_DECODE", "0") == "1",
+    # Triton paged decode indexer below SM 9.0: one program per request for
+    # spec decode, all NEXT_N query rows sharing one K tile load and decode,
+    # instead of one program per row. Needs native next_n decode (no flattening).
+    "VLLM_DSA_GROUPED_DECODE": lambda: os.getenv("VLLM_DSA_GROUPED_DECODE", "1") == "1",
     # moe_align_block_size on one Triton CTA for <= 128 (token, expert) pairs
     # instead of the CUDA op's fills + cub scans + align kernels. Off: it does
     # collapse the launches (2 -> 1) but the single CTA is slower than the two

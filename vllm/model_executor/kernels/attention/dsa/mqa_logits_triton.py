@@ -23,6 +23,7 @@ dot products run on fp16 tensor cores with an fp32 accumulator.
 
 import torch
 
+import vllm.envs as envs
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.triton_utils.fp8_e4m3 import e4m3fn_bits_to_fp32, needs_e4m3fn_emulation
@@ -41,6 +42,10 @@ def use_triton_mqa_logits() -> bool:
 # Tile sizes, swept on A40 (SM 8.6) at H=64, D=128.
 _PAGED_BLOCK_N = 64
 _PAGED_NUM_WARPS = 2
+# One program per request for spec decode (all NEXT_N rows share the K tile).
+_GROUPED_BLOCK_N = 32
+_GROUPED_NUM_WARPS = 4
+_GROUPED_NUM_STAGES = 2
 _BLOCK_M = 32
 _BLOCK_N = 64
 _NUM_WARPS = 4
@@ -136,6 +141,94 @@ def _fp8_paged_mqa_logits_kernel(
     tl.store(out_ptrs, tl.where(valid, s, float("-inf")), out_mask)
 
 
+@triton.jit
+def _fp8_paged_mqa_logits_grouped_kernel(
+    q_ptr,  # [B, NEXT_N, H, D] e4m3 (uint8 bits when EMULATE_E4M3)
+    kv_ptr,
+    w_ptr,  # [B * NEXT_N, H] fp32
+    ctx_ptr,  # [B, 1] or [B, NEXT_N] int32
+    bt_ptr,
+    out_ptr,  # [B * NEXT_N, max_model_len] fp32
+    ctx_stride_b,
+    ctx_stride_j,
+    bt_stride,
+    kv_block_stride,
+    out_stride,
+    max_model_len,
+    NEXT_N: tl.constexpr,
+    RP: tl.constexpr,  # NEXT_N rounded up to a power of two
+    H: tl.constexpr,
+    HP: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    TILE_IN_PAGE: tl.constexpr,
+    CTX_PER_TOKEN: tl.constexpr,
+    EMULATE_E4M3: tl.constexpr,
+):
+    """``_fp8_paged_mqa_logits_kernel`` with one program per request: the NEXT_N
+    query rows of a request see the same keys (their contexts differ by at most
+    NEXT_N - 1), so they share one K tile load and decode and one
+    ``[BLOCK_N, D] x [D, RP*HP]`` dot instead of NEXT_N of each."""
+    b = tl.program_id(0)
+    n0 = tl.program_id(1) * BLOCK_N
+    offs_n = n0 + tl.arange(0, BLOCK_N)
+    offs_r = tl.arange(0, RP)
+    r_mask = offs_r < NEXT_N
+    rows = b.to(tl.int64) * NEXT_N + offs_r
+    if CTX_PER_TOKEN:
+        lims = tl.load(
+            ctx_ptr + b * ctx_stride_b + offs_r * ctx_stride_j, mask=r_mask, other=0
+        )
+    else:
+        lims = tl.load(ctx_ptr + b * ctx_stride_b) - NEXT_N + 1 + offs_r
+    lims = tl.where(r_mask, tl.maximum(lims, 0), 0)
+    max_lim = tl.max(lims, axis=0)
+    out_ptrs = out_ptr + rows[None, :] * out_stride + offs_n[:, None]  # [BLOCK_N, RP]
+    out_mask = r_mask[None, :] & (offs_n < max_model_len)[:, None]
+    if n0 >= max_lim:
+        tl.store(out_ptrs, tl.full([BLOCK_N, RP], float("-inf"), tl.float32), out_mask)
+        return
+
+    # Q tile [RP*HP, D]: row r*HP + h is head h of query row r; padding rows
+    # and heads are zero and carry zero weight.
+    offs_rh = tl.arange(0, RP * HP)
+    r_of = offs_rh // HP
+    h_of = offs_rh % HP
+    rh_mask = (r_of < NEXT_N) & (h_of < H)
+    q_rows = (b.to(tl.int64) * NEXT_N + r_of) * H + h_of
+    offs_d = tl.arange(0, D)
+    q = _load_e4m3_as_f16(
+        q_ptr + q_rows[:, None] * D + offs_d[None, :], rh_mask[:, None], EMULATE_E4M3
+    )
+    w = tl.load(w_ptr + q_rows, mask=rh_mask, other=0.0)
+
+    valid = offs_n < max_lim
+    bt_row = bt_ptr + b.to(tl.int64) * bt_stride
+    if TILE_IN_PAGE:
+        page = tl.load(bt_row + n0 // BLOCK_SIZE).to(tl.int64)
+        pages = tl.zeros([BLOCK_N], dtype=tl.int64) + page
+        tok = (n0 % BLOCK_SIZE) + tl.arange(0, BLOCK_N)
+    else:
+        pages = tl.load(bt_row + offs_n // BLOCK_SIZE, mask=valid, other=0)
+        pages = pages.to(tl.int64)
+        tok = offs_n % BLOCK_SIZE
+    block_base = kv_ptr + pages * kv_block_stride
+    k = _load_e4m3_as_f16(
+        block_base[:, None] + tok[:, None] * D + offs_d[None, :],
+        valid[:, None],
+        EMULATE_E4M3,
+    )
+    scale_ptrs = (block_base + BLOCK_SIZE * D + tok * 4).to(tl.pointer_type(tl.float32))
+    scale = tl.load(scale_ptrs, mask=valid, other=0.0)
+
+    s = tl.dot(k, tl.trans(q))  # [BLOCK_N, RP*HP], fp32 accumulate
+    s = tl.reshape(tl.maximum(s, 0.0) * w[None, :], [BLOCK_N, RP, HP])
+    s = tl.sum(s, axis=2) * scale[:, None]  # [BLOCK_N, RP]
+    seen = offs_n[:, None] < lims[None, :]
+    tl.store(out_ptrs, tl.where(seen, s, float("-inf")), out_mask)
+
+
 def _paged_cache_block_stride(kv_cache: torch.Tensor, dim: int) -> int:
     """Byte stride between blocks of the packed ``uint8`` indexer K cache.
 
@@ -203,6 +296,36 @@ def fp8_paged_mqa_logits_triton(
     assert ctx_per_token or context_lens.shape[1] == 1, context_lens.shape
 
     out = torch.empty((rows, max_model_len), dtype=torch.float32, device=q.device)
+    if next_n > 1 and envs.VLLM_DSA_GROUPED_DECODE:
+        block_n = max(16, min(_GROUPED_BLOCK_N, block_size))
+        grid = (batch_size, triton.cdiv(max_model_len, block_n))
+        _fp8_paged_mqa_logits_grouped_kernel[grid](
+            q,
+            kv_cache,
+            weights,
+            context_lens,
+            block_table,
+            out,
+            context_lens.stride(0),
+            context_lens.stride(1),
+            block_table.stride(0),
+            kv_block_stride,
+            out.stride(0),
+            max_model_len,
+            NEXT_N=next_n,
+            RP=triton.next_power_of_2(next_n),
+            H=num_heads,
+            HP=max(16, triton.next_power_of_2(num_heads)),
+            D=dim,
+            BLOCK_SIZE=block_size,
+            BLOCK_N=block_n,
+            TILE_IN_PAGE=block_size % block_n == 0,
+            CTX_PER_TOKEN=ctx_per_token,
+            EMULATE_E4M3=emulate,
+            num_warps=_GROUPED_NUM_WARPS,
+            num_stages=_GROUPED_NUM_STAGES,
+        )
+        return out
     block_n = max(16, min(_PAGED_BLOCK_N, block_size))
     grid = (rows, triton.cdiv(max_model_len, block_n))
     _fp8_paged_mqa_logits_kernel[grid](
