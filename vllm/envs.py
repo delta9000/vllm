@@ -63,6 +63,8 @@ if TYPE_CHECKING:
     VLLM_DSA_SPARSE_DECODE: bool = False
     VLLM_DSA_GROUPED_DECODE: bool = True
     VLLM_DSA_SPLIT_PREFILL: bool = True
+    VLLM_DSV41_DUMP_DIR: str = ""
+    VLLM_DSV41_DUMP_MAX: int = 400
     VLLM_MOE_ALIGN_SMALL: bool = False
     VLLM_TRITON_GATE_GEMM: bool = True
     VLLM_DSV41_DECODE_BLACKLIST: str = "0,2,129262,129263,129264"
@@ -1118,6 +1120,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # chunk's query rows and the top-k indices are all-gathered, instead of
     # every rank scoring every row. Exact; dense (non-candidate) layers only.
     "VLLM_DSA_SPLIT_PREFILL": lambda: os.getenv("VLLM_DSA_SPLIT_PREFILL", "1") == "1",
+    # Debug: directory where DeepSeek V4.1 indexers save prefill-step inputs
+    # (pre-RoPE Q/K, weights, positions) for offline numerics studies; at
+    # most VLLM_DSV41_DUMP_MAX files. Empty disables.
+    "VLLM_DSV41_DUMP_DIR": lambda: os.getenv("VLLM_DSV41_DUMP_DIR", ""),
+    "VLLM_DSV41_DUMP_MAX": lambda: int(os.getenv("VLLM_DSV41_DUMP_MAX", "400")),
     # moe_align_block_size on one Triton CTA for <= 128 (token, expert) pairs
     # instead of the CUDA op's fills + cub scans + align kernels. Off: it does
     # collapse the launches (2 -> 1) but the single CTA is slower than the two

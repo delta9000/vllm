@@ -43,7 +43,10 @@ from vllm.config import (
     get_current_vllm_config,
 )
 from vllm.config.cache import CacheDType
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -825,6 +828,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.ln_events[1],
                 aux_stream,
             )
+            if envs.VLLM_DSV41_DUMP_DIR and indexer is not None and latent is not None:
+                _dump_step(
+                    self.prefix,
+                    indexer.k_cache.prefix,
+                    "attn",
+                    compressor.compress_ratio,
+                    q=q[:, : self.n_local_heads],
+                    latent=latent,
+                    positions=positions,
+                    scale=torch.tensor(self.scale),
+                    cos_sin_attn=self.rotary_emb.cos_sin_cache,
+                )
         else:
             q = project_query_and_cache_kv()
 
@@ -1190,6 +1205,59 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         return DeepseekV41IndexerBackend
 
 
+_DUMP_COUNTS: dict[str, int] = {}
+
+
+def _dump_indexer(indexer: "DeepseekV4Indexer", kind: str, **tensors) -> None:
+    _dump_step(
+        indexer.prefix, indexer.k_cache.prefix, kind, indexer.compress_ratio, **tensors
+    )
+
+
+def _dump_step(
+    prefix: str, meta_prefix: str, kind: str, compress_ratio: int, **tensors
+) -> None:
+    """Debug: save one prefill step's layer inputs (pre-RoPE, pre-quant) under
+    VLLM_DSV41_DUMP_DIR for offline numerics studies. Rank 0 only; skips graph
+    capture, profile runs and decode-only steps; at most VLLM_DSV41_DUMP_MAX
+    files per process. ``meta_prefix`` names the indexer metadata that says
+    whether the step prefills."""
+    if get_tensor_model_parallel_rank() != 0:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    attn_metadata = get_forward_context().attn_metadata
+    if not isinstance(attn_metadata, dict):
+        return
+    meta = cast(Any, attn_metadata[meta_prefix])
+    if not getattr(meta, "num_prefill_tokens", 0):
+        return
+    total = sum(_DUMP_COUNTS.values())
+    if total >= envs.VLLM_DSV41_DUMP_MAX:
+        return
+    import os
+
+    out_dir = envs.VLLM_DSV41_DUMP_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    for name in ("cos_sin_cache", "cos_sin_attn"):
+        cos_sin = tensors.pop(name, None)
+        path = os.path.join(out_dir, name.replace("_cache", "") + ".pt")
+        if cos_sin is not None and not os.path.exists(path):
+            torch.save(cos_sin.detach().cpu(), path)
+    key = f"{prefix}.{kind}"
+    n = _DUMP_COUNTS.get(key, 0)
+    _DUMP_COUNTS[key] = n + 1
+    payload = {k: v.detach().cpu() for k, v in tensors.items()}
+    payload.update(
+        layer=prefix,
+        compress_ratio=compress_ratio,
+        num_prefill_tokens=int(meta.num_prefill_tokens),
+        num_decode_tokens=int(meta.num_decode_tokens),
+        step=total,
+    )
+    torch.save(payload, os.path.join(out_dir, f"{total:05d}_{key}.{n}.pt"))
+
+
 class DeepseekV4Indexer(nn.Module):
     """DeepSeek V4.1 sparse-attention indexer.
 
@@ -1356,6 +1424,17 @@ class DeepseekV4Indexer(nn.Module):
         # non-boundary tokens hold garbage latent and are skipped by the
         # store kernel.
         k_pre, _ = self.wk(latent)
+        if envs.VLLM_DSV41_DUMP_DIR:
+            _dump_indexer(
+                self,
+                "k",
+                k_pre=k_pre,
+                positions=positions,
+                slot_mapping=indexer_metadata.slot_mapping,
+                k_norm_weight=self.k_norm.weight,
+                k_norm_eps=torch.tensor(self.k_norm.variance_epsilon),
+                cos_sin_cache=rotary_emb.cos_sin_cache,
+            )
         indexer_k_norm_rope_store(
             k_pre,
             positions,
@@ -1411,6 +1490,16 @@ class DeepseekV4Indexer(nn.Module):
 
         q = self._wq_b_proj(qr, qr_scale)
         q = q.view(-1, self.n_head, self.head_dim)
+        if envs.VLLM_DSV41_DUMP_DIR:
+            _dump_indexer(
+                self,
+                "q",
+                q=q,
+                weights=indexer_weights,
+                positions=positions,
+                softmax_scale=torch.tensor(self.softmax_scale),
+                head_scale=torch.tensor(self.n_head**-0.5),
+            )
         q_quant, weights = fused_indexer_q_rope_quant(
             positions,
             q,
