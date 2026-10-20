@@ -15,11 +15,12 @@ gated on gfx942/gfx950 and never engage on CUDA, where the generic
 single-pass decode kernel runs with e4m3 emulated below SM 8.9.
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
 import vllm.envs as envs
+from vllm.config.cache import CacheDType
 from vllm.models.deepseek_v41.common.ops import compute_global_topk_indices_and_lens
 from vllm.models.deepseek_v41.common.ops.mxfp8_qdq import mxfp8_qdq_
 from vllm.model_executor.kernels.linear.mxfp8.marlin import (
@@ -51,6 +52,16 @@ if TYPE_CHECKING:
 
 
 class DeepseekV41TritonMLASparseBackend(DeepseekV4FlashMLABackend):
+    # nvfp4_ds_mla here: the V4 fp8_ds_mla SWA record (584 B) plus the V4.1
+    # NVFP4 compressed record (288 B), decoded in software (no FP4/FP8 math on
+    # SM 8.x). Half the compressed-cache bytes per token.
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "fp8_ds_mla",
+        "fp8",  # alias for fp8_ds_mla
+        "nvfp4_ds_mla",
+    ]
+
     @staticmethod
     def get_name() -> str:
         return "TRITON_MLA_SPARSE_DSV41"

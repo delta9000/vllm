@@ -9,6 +9,8 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.triton_utils.fp8_e4m3 import (
     ceil_log2,
+    e4m3fn_bits_to_fp32,
+    fp32_to_e2m1_bits,
     fp32_to_e4m3fn_bits,
     needs_e4m3fn_emulation,
 )
@@ -428,6 +430,7 @@ def _rope_quant_insert_nvfp4_kernel(
     CACHE_BLOCK: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     SANITIZE_CACHE_NANS: tl.constexpr,
+    EMULATE_E4M3: tl.constexpr = False,
 ):
     """V4.1 NVFP4 record: RoPE, then e2m1 with one e4m3 scale per 16 dims.
 
@@ -457,19 +460,29 @@ def _rope_quant_insert_nvfp4_kernel(
     tiles = tl.reshape(rotated, (32, 16))
     amax = tl.max(tl.abs(tiles), 1)
     # 2**-9 is the smallest normal e4m3 magnitude; 448 the largest.
-    scale = tl.clamp(amax * (1.0 / 6.0), 0.001953125, 448.0).to(tl.float8e4nv)
+    scale_raw = tl.clamp(amax * (1.0 / 6.0), 0.001953125, 448.0)
+    if EMULATE_E4M3:
+        # No e4m3 or e2m1 conversions below SM 8.9 / SM 10.x: integer encodes,
+        # bitwise-identical to the hardware ones.
+        scale_bits = fp32_to_e4m3fn_bits(scale_raw)
+        scale_f = e4m3fn_bits_to_fp32(scale_bits)
+    else:
+        scale8 = scale_raw.to(tl.float8e4nv)
+        scale_bits = scale8.to(tl.uint8, bitcast=True)
+        scale_f = scale8.to(tl.float32)
     # Round-to-nearest division: Triton's default div.full misplaces values
     # that land exactly on an e2m1 tie.
-    scaled = tl.math.div_rn(tiles, tl.reshape(scale.to(tl.float32), (32, 1)))
+    scaled = tl.math.div_rn(tiles, tl.reshape(scale_f, (32, 1)))
     lo, hi = tl.split(tl.reshape(tl.reshape(scaled, (512,)), (256, 2)))
+    if EMULATE_E4M3:
+        packed = (fp32_to_e2m1_bits(lo) | (fp32_to_e2m1_bits(hi) << 4)).to(tl.uint8)
+    else:
+        packed = _fp32x2_to_fp4x2(lo, hi)
 
     page = cache + (slot // CACHE_BLOCK).to(tl.int64) * CACHE_STRIDE
-    tl.store(
-        page + (slot % CACHE_BLOCK) * 256 + tl.arange(0, 256),
-        _fp32x2_to_fp4x2(lo, hi),
-    )
+    tl.store(page + (slot % CACHE_BLOCK) * 256 + tl.arange(0, 256), packed)
     scales = page + CACHE_BLOCK * 256 + (slot % CACHE_BLOCK) * 32
-    tl.store(scales + tl.arange(0, 32), scale.to(tl.uint8, bitcast=True))
+    tl.store(scales + tl.arange(0, 32), scale_bits)
 
 
 @triton.jit

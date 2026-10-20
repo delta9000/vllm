@@ -529,6 +529,7 @@ def _dequantize_and_gather_k_nvfp4_kernel(
     quant_block: tl.constexpr,  # 16
     cache_block_size: tl.constexpr,
     block_stride: tl.constexpr,
+    EMULATE_E4M3: tl.constexpr = False,
 ):
     """Gather and dequantize V4.1 NVFP4 rows into a bf16 workspace."""
     batch_idx = tl.program_id(0)
@@ -572,7 +573,10 @@ def _dequantize_and_gather_k_nvfp4_kernel(
             + pos_in_block * scale_dim
             + tl.arange(0, scale_dim)
         )
-        scale = sf.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        if EMULATE_E4M3:
+            scale = e4m3fn_bits_to_fp32(sf)
+        else:
+            scale = sf.to(tl.float8e4nv, bitcast=True).to(tl.float32)
         tiles = tl.reshape(vals, (scale_dim, quant_block))
         dequant = tl.reshape(tiles * tl.reshape(scale, (scale_dim, 1)), (head_dim,))
 
@@ -617,6 +621,7 @@ def dequantize_and_gather_k_cache_triton(
             quant_block=V41_NVFP4_QUANT_BLOCK,
             cache_block_size=block_size,
             block_stride=k_cache.stride(0),
+            EMULATE_E4M3=needs_e4m3fn_emulation(),
         )
         return
 

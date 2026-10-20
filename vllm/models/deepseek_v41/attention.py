@@ -516,10 +516,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # sum, and 512 satisfies both TMA strides in play (512 for the V4.1
         # fp8 record, 256 for NVFP4).
         self.kv_page_alignment = 512 if self.kv_mxfp8 else 576
-        if self.kv_cache_dtype == "nvfp4_ds_mla" and not self.kv_mxfp8:
+        if (
+            self.kv_cache_dtype == "nvfp4_ds_mla"
+            and not self.kv_mxfp8
+            and not current_platform.is_device_capability_family(80)
+        ):
+            # SM 8.x pairs the V4 SWA record with the NVFP4 compressed one,
+            # both decoded by the Triton sparse kernels.
             raise ValueError(
                 "nvfp4_ds_mla needs the V4.1 KV records, which FlashMLA "
-                "decodes only on SM100."
+                "decodes only on SM100 (or the SM 8.x Triton kernels)."
             )
 
         swa_bounded_replay = cache_config.swa_bounded_replay

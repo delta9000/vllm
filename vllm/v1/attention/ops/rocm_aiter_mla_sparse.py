@@ -16,7 +16,12 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.triton_utils.fp8_e4m3 import e4m3fn_bits_to_bf16, needs_e4m3fn_emulation
+from vllm.triton_utils.fp8_e4m3 import (
+    e2m1_bits_to_fp32,
+    e4m3fn_bits_to_bf16,
+    e4m3fn_bits_to_fp32,
+    needs_e4m3fn_emulation,
+)
 from vllm.utils.torch_utils import LayerNameType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
@@ -2015,6 +2020,55 @@ def _load_fp8_ds_mla_gfx950_tail128(
 
 
 @triton.jit
+def _fp4_kv_dims(data, scales, dims, mask, EMULATE_E4M3: tl.constexpr):
+    """bf16 values of record dims ``dims`` for every row: e2m1 nibble
+    ``dims & 1`` of byte ``dims // 2`` times e4m3 scale ``dims // 16``."""
+    packed = tl.load(data[:, None] + (dims // 2)[None, :], mask=mask, other=0)
+    code = (packed.to(tl.int32) >> ((dims & 1) * 4)[None, :]) & 15
+    sbits = tl.load(scales[:, None] + (dims // 16)[None, :], mask=mask, other=0)
+    if EMULATE_E4M3:
+        scale = e4m3fn_bits_to_fp32(sbits)
+    else:
+        scale = sbits.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    # e2m1 x e4m3 has at most 4 significant bits: exact in bf16.
+    return tl.where(mask, e2m1_bits_to_fp32(code) * scale, 0.0).to(tl.bfloat16)
+
+
+@triton.jit
+def _load_fp4_kv_record(
+    cache_ptr,
+    slot,
+    valid,
+    cache_stride0,
+    block_size,
+    nope_offsets,
+    nope_mask,
+    rope_offsets,
+    NOPE_DIM: tl.constexpr,
+    EMULATE_E4M3: tl.constexpr,
+):
+    """NoPE ``[BLOCK_K, NOPE_BLOCK]`` and RoPE ``[BLOCK_K, ROPE_DIM]`` bf16 tiles
+    of V4.1 NVFP4 compressed-KV records (288 B: a page's 256 B rows of e2m1
+    pairs, even dim in the low nibble, then its 32 B rows of e4m3 scales, one
+    per 16 dims; RoPE dims are quantized like the rest)."""
+    page = cache_ptr + (slot // block_size).to(tl.int64) * cache_stride0
+    pos = slot % block_size
+    data = page + pos * 256
+    scales = page + block_size * 256 + pos * 32
+    k_nope = _fp4_kv_dims(
+        data, scales, nope_offsets, valid[:, None] & nope_mask[None, :], EMULATE_E4M3
+    )
+    k_rope = _fp4_kv_dims(
+        data,
+        scales,
+        NOPE_DIM + rope_offsets,
+        valid[:, None] & (rope_offsets >= 0)[None, :],
+        EMULATE_E4M3,
+    )
+    return k_nope, k_rope
+
+
+@triton.jit
 def _sparse_attn_decode_ragged_kernel(
     q_ptr,
     main_cache_ptr,
@@ -2051,6 +2105,7 @@ def _sparse_attn_decode_ragged_kernel(
     # OCP e4m3 decoded with integer ops, for CUDA below SM 8.9 (the only
     # platform that reaches this fallback without native fp8e4nv).
     EMULATE_E4M3: tl.constexpr = False,
+    EXTRA_FP4: tl.constexpr = False,
 ):
     query_idx = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -2160,45 +2215,59 @@ def _sparse_attn_decode_ragged_kernel(
             valid = in_range & (slot >= 0) & (slot < extra_num_rows)
             safe_slot = tl.where(valid, slot, 0)
 
-            block_idx = safe_slot // extra_block_size
-            pos_in_block = safe_slot % extra_block_size
-            cache_block_ptr = (
-                extra_cache_ptr + block_idx.to(tl.int64) * extra_cache_stride0
-            )
-            token_data_ptr = cache_block_ptr + pos_in_block * 576
-            token_scale_ptr = (
-                cache_block_ptr + extra_block_size * 576 + pos_in_block * 8
-            )
-
-            x_uint8 = tl.load(
-                token_data_ptr[:, None] + nope_offsets[None, :],
-                mask=valid[:, None] & nope_mask[None, :],
-                other=0,
-            )
-            if EMULATE_E4M3:
-                x_fp8 = e4m3fn_bits_to_bf16(x_uint8)
-            elif IS_FNUZ_EXTRA:
-                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+            if EXTRA_FP4:
+                k_nope, k_rope = _load_fp4_kv_record(
+                    extra_cache_ptr,
+                    safe_slot,
+                    valid,
+                    extra_cache_stride0,
+                    extra_block_size,
+                    nope_offsets,
+                    nope_mask,
+                    rope_offsets,
+                    NOPE_DIM,
+                    EMULATE_E4M3,
+                )
             else:
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            encoded_scales = tl.load(
-                token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
-                mask=valid[:, None] & nope_mask[None, :],
-                other=127,
-            )
-            scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
-            k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
-            k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+                block_idx = safe_slot // extra_block_size
+                pos_in_block = safe_slot % extra_block_size
+                cache_block_ptr = (
+                    extra_cache_ptr + block_idx.to(tl.int64) * extra_cache_stride0
+                )
+                token_data_ptr = cache_block_ptr + pos_in_block * 576
+                token_scale_ptr = (
+                    cache_block_ptr + extra_block_size * 576 + pos_in_block * 8
+                )
 
-            rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
-            k_rope = tl.load(
-                rope_ptr[:, None] + rope_offsets[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            )
-            k_rope = tl.where(valid[:, None], k_rope, zero_rope)
-            k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
+                x_uint8 = tl.load(
+                    token_data_ptr[:, None] + nope_offsets[None, :],
+                    mask=valid[:, None] & nope_mask[None, :],
+                    other=0,
+                )
+                if EMULATE_E4M3:
+                    x_fp8 = e4m3fn_bits_to_bf16(x_uint8)
+                elif IS_FNUZ_EXTRA:
+                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+                else:
+                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+                encoded_scales = tl.load(
+                    token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                    mask=valid[:, None] & nope_mask[None, :],
+                    other=127,
+                )
+                scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+                k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+                k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+                k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+
+                rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+                k_rope = tl.load(
+                    rope_ptr[:, None] + rope_offsets[None, :],
+                    mask=valid[:, None],
+                    other=0.0,
+                )
+                k_rope = tl.where(valid[:, None], k_rope, zero_rope)
+                k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
 
             scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(
                 q_rope,
@@ -2299,6 +2368,7 @@ def _sparse_attn_decode_partial_kernel(
     NUM_SPLITS: tl.constexpr,
     NUM_STAGES: tl.constexpr,
     EMULATE_E4M3: tl.constexpr = False,
+    EXTRA_FP4: tl.constexpr = False,
 ):
     query_idx = tl.program_id(0)
     split_id = tl.program_id(1)
@@ -2418,45 +2488,59 @@ def _sparse_attn_decode_partial_kernel(
             valid = in_range & (slot >= 0) & (slot < extra_num_rows)
             safe_slot = tl.where(valid, slot, 0)
 
-            block_idx = safe_slot // extra_block_size
-            pos_in_block = safe_slot % extra_block_size
-            cache_block_ptr = (
-                extra_cache_ptr + block_idx.to(tl.int64) * extra_cache_stride0
-            )
-            token_data_ptr = cache_block_ptr + pos_in_block * 576
-            token_scale_ptr = (
-                cache_block_ptr + extra_block_size * 576 + pos_in_block * 8
-            )
-
-            x_uint8 = tl.load(
-                token_data_ptr[:, None] + nope_offsets[None, :],
-                mask=valid[:, None] & nope_mask[None, :],
-                other=0,
-            )
-            if EMULATE_E4M3:
-                x_fp8 = e4m3fn_bits_to_bf16(x_uint8)
-            elif IS_FNUZ_EXTRA:
-                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+            if EXTRA_FP4:
+                k_nope, k_rope = _load_fp4_kv_record(
+                    extra_cache_ptr,
+                    safe_slot,
+                    valid,
+                    extra_cache_stride0,
+                    extra_block_size,
+                    nope_offsets,
+                    nope_mask,
+                    rope_offsets,
+                    NOPE_DIM,
+                    EMULATE_E4M3,
+                )
             else:
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            encoded_scales = tl.load(
-                token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
-                mask=valid[:, None] & nope_mask[None, :],
-                other=127,
-            )
-            scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
-            k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
-            k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+                block_idx = safe_slot // extra_block_size
+                pos_in_block = safe_slot % extra_block_size
+                cache_block_ptr = (
+                    extra_cache_ptr + block_idx.to(tl.int64) * extra_cache_stride0
+                )
+                token_data_ptr = cache_block_ptr + pos_in_block * 576
+                token_scale_ptr = (
+                    cache_block_ptr + extra_block_size * 576 + pos_in_block * 8
+                )
 
-            rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
-            k_rope = tl.load(
-                rope_ptr[:, None] + rope_offsets[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            )
-            k_rope = tl.where(valid[:, None], k_rope, zero_rope)
-            k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
+                x_uint8 = tl.load(
+                    token_data_ptr[:, None] + nope_offsets[None, :],
+                    mask=valid[:, None] & nope_mask[None, :],
+                    other=0,
+                )
+                if EMULATE_E4M3:
+                    x_fp8 = e4m3fn_bits_to_bf16(x_uint8)
+                elif IS_FNUZ_EXTRA:
+                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+                else:
+                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+                encoded_scales = tl.load(
+                    token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                    mask=valid[:, None] & nope_mask[None, :],
+                    other=127,
+                )
+                scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+                k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+                k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+                k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+
+                rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+                k_rope = tl.load(
+                    rope_ptr[:, None] + rope_offsets[None, :],
+                    mask=valid[:, None],
+                    other=0.0,
+                )
+                k_rope = tl.where(valid[:, None], k_rope, zero_rope)
+                k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
 
             scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(
                 q_rope,
@@ -3411,6 +3495,9 @@ def _rocm_sparse_attn_decode_ragged_triton(
     comb_dim = nope_head_dim + rope_head_dim
     is_fnuz = current_platform.is_fp8_fnuz()
     emulate_e4m3 = not is_fnuz and needs_e4m3fn_emulation()
+    # The compressed cache may hold V4.1 NVFP4 records (288 B) instead of the
+    # V4 fp8_ds_mla ones the SWA cache keeps; its record width says which.
+    extra_fp4 = has_extra and extra_cache.shape[-1] == 288
 
     if not _SPLIT_K_DECODE:  # Fallback path for un-tuned architectures.
         block_k = 16 if head_dim >= 256 else 32
@@ -3446,6 +3533,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             BLOCK_H=block_h,
             BLOCK_K=block_k,
             EMULATE_E4M3=emulate_e4m3,
+            EXTRA_FP4=extra_fp4,
             num_warps=8,
         )
         return out
@@ -3493,6 +3581,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
     )
 
     if _ON_GFX950:
+        assert not extra_fp4, "NVFP4 compressed records: CUDA decode only"
         _sparse_attn_decode_gfx950_partial_kernel[
             (num_queries, num_splits, heads_blocks)
         ](
@@ -3573,6 +3662,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             NUM_SPLITS=num_splits,
             NUM_STAGES=1,
             EMULATE_E4M3=emulate_e4m3,
+            EXTRA_FP4=extra_fp4,
             num_warps=4,
         )
 

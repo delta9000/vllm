@@ -107,3 +107,39 @@ def ceil_log2(x):
     bits = x.to(tl.int32, bitcast=True)
     e = ((bits >> 23) & 0xFF) - 127 + ((bits & 0x7FFFFF) != 0).to(tl.int32)
     return e.to(tl.float32)
+
+
+@triton.jit
+def fp32_to_e2m1_bits(x):
+    """Encode ``float32`` to e2m1 (FP4) codes, ``int32`` in [0, 15].
+
+    Round-to-nearest-even, saturating to +-6 like ``cvt.rn.satfinite.e2m1x2``
+    (an SM 10.x instruction). The magnitude codes 0..7 stand for 0, 0.5, 1,
+    1.5, 2, 3, 4, 6; with the thresholds monotonic, the code is the number of
+    them the magnitude clears, ties going to the even code. Bit 3 is the sign
+    (so -0.0 encodes as 8).
+    """
+    a = tl.abs(x)
+    code = (
+        (a > 0.25).to(tl.int32)
+        + (a >= 0.75).to(tl.int32)
+        + (a > 1.25).to(tl.int32)
+        + (a >= 1.75).to(tl.int32)
+        + (a > 2.5).to(tl.int32)
+        + (a >= 3.5).to(tl.int32)
+        + (a > 5.0).to(tl.int32)
+    )
+    sign = (x.to(tl.int32, bitcast=True) >> 31) & 1
+    return code | (sign << 3)
+
+
+@triton.jit
+def e2m1_bits_to_fp32(c):
+    """Decode e2m1 codes (low 4 bits of ``c``) to ``float32``, exactly."""
+    c = c.to(tl.int32)
+    m = c & 7
+    e = m >> 1
+    # normals: 2^(e-1) * (1 + mantissa/2); code 1 is the subnormal 0.5
+    normal = (((e + 126) << 23) | ((m & 1) << 22)).to(tl.float32, bitcast=True)
+    mag = tl.where(e == 0, (m & 1).to(tl.float32) * 0.5, normal)
+    return (mag.to(tl.int32, bitcast=True) | ((c & 8) << 28)).to(tl.float32, bitcast=True)
