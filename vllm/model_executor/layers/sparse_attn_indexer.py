@@ -10,7 +10,7 @@ from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CUDAGraphMode, get_current_vllm_config
-from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.distributed import get_dcp_group, get_pcp_group, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
@@ -89,6 +89,78 @@ def _assert_cutedsl_dcp_merge_supported(
             f"DCP sparse-indexer merge requires index_topk in (512, 1024, 2048); "
             f"got {k}."
         )
+
+
+def _split_prefill_rows(
+    num_rows: int,
+    use_fp4_cache: bool,
+    candidate_blocks: torch.Tensor | None,
+    deinterleave_idx: torch.Tensor | None,
+) -> bool:
+    """Whether this prefill chunk's logits and top-k run on 1/TP of its rows per
+    rank (``_tp_split_prefill_topk``) instead of all rows on every rank.
+
+    The indexer weights are replicated, so every TP rank used to score every
+    query row. Rows are independent, so splitting them is exact. Kept to the
+    Triton FP8 path without candidate blocks (the dense v4.1 indexers; under
+    decoder replay the candidate source no longer scores every prefill row),
+    without context parallelism, and outside graph capture.
+    """
+    if not envs.VLLM_DSA_SPLIT_PREFILL or use_fp4_cache:
+        return False
+    if candidate_blocks is not None or deinterleave_idx is not None:
+        return False
+    if not use_triton_mqa_logits() or torch.cuda.is_current_stream_capturing():
+        return False
+    tp_size = get_tp_group().world_size
+    return tp_size > 1 and num_rows >= 2 * tp_size
+
+
+def _tp_split_prefill_topk(
+    q: torch.Tensor,
+    k_quant: torch.Tensor,
+    k_scale: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+) -> torch.Tensor:
+    """Score this rank's contiguous 1/TP share of the chunk's query rows, take
+    their top-k, and all-gather the int32 indices into ``topk_indices``.
+
+    Returns this rank's logits (its rows only); callers must not read them as
+    the full chunk's.
+    """
+    tp = get_tp_group()
+    num_rows = q.shape[0]
+    rows_per_rank = triton.cdiv(num_rows, tp.world_size)
+    lo = min(tp.rank_in_group * rows_per_rank, num_rows)
+    hi = min(lo + rows_per_rank, num_rows)
+    local = torch.full(
+        (rows_per_rank, topk_tokens), -1, dtype=topk_indices.dtype, device=q.device
+    )
+    logits = q.new_empty((0, 0), dtype=torch.float32)
+    if hi > lo:
+        logits = fp8_mqa_logits_triton(
+            q[lo:hi],
+            (k_quant, k_scale),
+            weights[lo:hi],
+            cu_seqlen_ks[lo:hi],
+            cu_seqlen_ke[lo:hi],
+        )
+        ops.top_k_per_row_prefill(
+            logits,
+            cu_seqlen_ks[lo:hi],
+            cu_seqlen_ke[lo:hi],
+            local,
+            hi - lo,
+            logits.stride(0),
+            logits.stride(1),
+            topk_tokens,
+        )
+    topk_indices.copy_(tp.all_gather(local, dim=0)[:num_rows])
+    return logits
 
 
 def _merge_dcp_topk_global(
@@ -568,6 +640,19 @@ def sparse_attn_indexer(
             if chunk.local_total_seq_lens == 0 or q_slice.shape[0] == 0:
                 logits = q_slice.new_empty((q_slice.shape[0], 0), dtype=torch.float32)
                 topk_indices.fill_(-1)
+            elif _split_prefill_rows(
+                q_slice.shape[0], use_fp4_cache, candidate_blocks, deinterleave_idx
+            ):
+                logits = _tp_split_prefill_topk(
+                    q_slice,
+                    k_quant,
+                    k_scale.view(torch.float32).squeeze(-1),
+                    weights[chunk.token_start : chunk.token_end],
+                    cu_seqlen_ks,
+                    cu_seqlen_ke,
+                    topk_indices,
+                    topk_tokens,
+                )
             else:
                 # DeepGEMM scalar-type tags (zero-copy): MXFP4 values → int8
                 # (kPackedFP4), scales → int32 squeezed to 1-D kv_sf / 2-D q_sf.

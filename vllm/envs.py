@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR: int = 40
     VLLM_DSA_SPARSE_DECODE: bool = False
     VLLM_DSA_GROUPED_DECODE: bool = True
+    VLLM_DSA_SPLIT_PREFILL: bool = True
     VLLM_MOE_ALIGN_SMALL: bool = False
     VLLM_TRITON_GATE_GEMM: bool = True
     VLLM_DSV41_DECODE_BLACKLIST: str = "0,2,129262,129263,129264"
@@ -1113,6 +1114,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # spec decode, all NEXT_N query rows sharing one K tile load and decode,
     # instead of one program per row. Needs native next_n decode (no flattening).
     "VLLM_DSA_GROUPED_DECODE": lambda: os.getenv("VLLM_DSA_GROUPED_DECODE", "1") == "1",
+    # Triton prefill indexer below SM 9.0: each TP rank scores 1/TP of a
+    # chunk's query rows and the top-k indices are all-gathered, instead of
+    # every rank scoring every row. Exact; dense (non-candidate) layers only.
+    "VLLM_DSA_SPLIT_PREFILL": lambda: os.getenv("VLLM_DSA_SPLIT_PREFILL", "1") == "1",
     # moe_align_block_size on one Triton CTA for <= 128 (token, expert) pairs
     # instead of the CUDA op's fills + cub scans + align kernels. Off: it does
     # collapse the launches (2 -> 1) but the single CTA is slower than the two
