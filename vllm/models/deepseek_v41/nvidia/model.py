@@ -24,6 +24,7 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     mhc_pre_delayed_tilelang,
 )
 from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
+from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )

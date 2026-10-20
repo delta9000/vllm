@@ -154,7 +154,10 @@ FLASHINFER_MOE_EP_BACKENDS = frozenset(
 # prepare_megamoe routing): vLLM's native deep_gemm path, which any model
 # with a mega-MoE module may use (DeepSeek-V4, Kimi K3), plus the flashinfer
 # moe_ep variants.
-MEGA_MOE_BACKENDS = frozenset({"deep_gemm_mega_moe"}) | FLASHINFER_MOE_EP_BACKENDS
+# vLLM's own mega-MoE path (name from upstream 111f71a6db, which this
+# branch predates; the decoder-replay graphs key off it).
+NATIVE_MEGA_MOE_BACKENDS = frozenset({"deep_gemm_mega_moe"})
+MEGA_MOE_BACKENDS = NATIVE_MEGA_MOE_BACKENDS | FLASHINFER_MOE_EP_BACKENDS
 
 SparseIndexerTopkBackend = Literal[
     "auto",
