@@ -800,8 +800,21 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             assert intermediate_tensors is not None
             pre_mix = intermediate_tensors["pre_mix"]
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
+        # Without a replay batch (decode, FULL graphs, profiling) the replay
+        # layers run on the whole batch anyway: keep them in this loop, where each
+        # layer's inputs die as the next layer starts. Handing the last KV
+        # source's outputs to the replay wrapper keeps them referenced by its
+        # frames through every later layer (~0.2 GiB/rank of peak activation at
+        # 4096 tokens), most of the KV headroom at 512k on 48 GB GPUs.
+        use_replay_batch = (
+            self.decoder_replay_layers is not None
+            and self.decoder_replay_layers.uses_replay_batch()
+        )
         hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
-            range(self.start_layer, self.decoder_replay_start),
+            range(
+                self.start_layer,
+                self.decoder_replay_start if use_replay_batch else self.end_layer,
+            ),
             hidden_states,
             positions,
             input_ids,
@@ -814,7 +827,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             engram_mask,
         )
         late_aux: list[torch.Tensor] = []
-        if self.decoder_replay_layers is not None:
+        if use_replay_batch:
+            assert self.decoder_replay_layers is not None
             hidden_states, pre_mix, *late_aux = self.decoder_replay_layers(
                 hidden_states,
                 positions,

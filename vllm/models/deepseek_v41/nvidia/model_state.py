@@ -12,6 +12,7 @@ from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group
 from vllm.forward_context import BatchDescriptor, DPMetadata, create_forward_context
+from vllm.logger import init_logger
 from vllm.models.deepseek_v41.decoder_replay_layers import (
     DecoderReplayLayers,
     ReplayBatch,
@@ -35,6 +36,8 @@ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -254,6 +257,7 @@ class DeepseekV41ModelState(DefaultModelState):
             # The graphs' fixed inputs hold no LoRA mapping and no None input ids.
             and vllm_config.lora_config is None
             and not vllm_config.model_config.enable_prompt_embeds
+            and self._replay_graphs_can_run(vllm_config, layers.window)
         ):
             threshold = compilation_config.decoder_replay_trim_threshold
             if threshold <= layers.window:
@@ -265,6 +269,30 @@ class DeepseekV41ModelState(DefaultModelState):
                 vllm_config, device, layers
             )
             layers.trim_threshold = threshold
+
+    @staticmethod
+    def _replay_graphs_can_run(vllm_config: VllmConfig, window: int) -> bool:
+        """Whether any replay graph could ever be dispatched. Replay batches hold
+        at least ``window`` rows and break out of PIECEWISE model graphs only at
+        ``decoder_replay_trim_threshold`` tokens, so with the default sizes and a
+        max capture size below the window (e.g. 96 on 48 GB GPUs) the graphs are
+        dead weight: ~0.16 GiB/rank of graph memory that never replays."""
+        compilation = vllm_config.compilation_config
+        if compilation.decoder_replay_cudagraph_capture_sizes:
+            return True
+        bound = min(
+            compilation.max_cudagraph_capture_size,
+            vllm_config.scheduler_config.max_num_seqs * window,
+        )
+        if bound >= window:
+            return True
+        logger.info_once(
+            "Decoder replay CUDA graphs off: max capture size %d is below the "
+            "%d-token replay window, so none could run; replay batches run eagerly.",
+            compilation.max_cudagraph_capture_size,
+            window,
+        )
+        return False
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
