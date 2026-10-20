@@ -12,7 +12,11 @@ through integer bit patterns, so it compiles below SM 8.9.
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm.triton_utils.fp8_e4m3 import e4m3fn_bits_to_fp32, fp32_to_e4m3fn_bits
+from vllm.triton_utils.fp8_e4m3 import (
+    ceil_log2,
+    e4m3fn_bits_to_fp32,
+    fp32_to_e4m3fn_bits,
+)
 
 MXFP8_GROUP_SIZE = 32
 
@@ -32,7 +36,7 @@ def _mxfp8_qdq_kernel(
     x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     # Reference: amax floored at 1e-4, scale rounded up to a power of two.
     amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)
-    scale = tl.math.exp2(tl.ceil(tl.log2(amax * (1.0 / 448.0))))
+    scale = tl.math.exp2(ceil_log2(amax * (1.0 / 448.0)))
     q = fp32_to_e4m3fn_bits(x / scale[:, None])
     y = e4m3fn_bits_to_fp32(q) * scale[:, None]
     tl.store(x_ptr + offs, y.to(x_ptr.dtype.element_ty), mask=mask)

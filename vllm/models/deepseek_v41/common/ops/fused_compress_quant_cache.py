@@ -7,7 +7,11 @@ import torch
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import _fp32x2_to_fp4x2
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.triton_utils.fp8_e4m3 import fp32_to_e4m3fn_bits, needs_e4m3fn_emulation
+from vllm.triton_utils.fp8_e4m3 import (
+    ceil_log2,
+    fp32_to_e4m3fn_bits,
+    needs_e4m3fn_emulation,
+)
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX950
@@ -331,7 +335,7 @@ def _rope_quant_insert_kernel(
 
     quant = tl.reshape(normed, (8, 64))
     amax = tl.maximum(tl.max(tl.abs(quant), 1), 1e-4)
-    exponent = tl.ceil(tl.log2(amax * (1.0 / 448.0)))
+    exponent = ceil_log2(amax * (1.0 / 448.0))
     scaled = quant * tl.reshape(tl.exp2(-exponent), (8, 1))
     clamped = tl.clamp(scaled, -448.0, 448.0)
     if EMULATE_E4M3:
@@ -402,7 +406,7 @@ def _rope_quant_insert_mxfp8_kernel(
 
     quant = tl.reshape(rotated, (16, 32))
     amax = tl.maximum(tl.max(tl.abs(quant), 1), 1e-4)
-    exponent = tl.ceil(tl.log2(amax * (1.0 / 448.0)))
+    exponent = ceil_log2(amax * (1.0 / 448.0))
     scaled = quant * tl.reshape(tl.exp2(-exponent), (16, 1))
     fp8 = tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv)
     tl.store(values + d, tl.reshape(fp8.to(tl.uint8, bitcast=True), (512,)))

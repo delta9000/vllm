@@ -17,7 +17,11 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.triton_utils.fp8_e4m3 import fp32_to_e4m3fn_bits, needs_e4m3fn_emulation
+from vllm.triton_utils.fp8_e4m3 import (
+    ceil_log2,
+    fp32_to_e4m3fn_bits,
+    needs_e4m3fn_emulation,
+)
 
 from . import MXFP4_BLOCK_SIZE, _fp32x2_to_fp4x2
 
@@ -224,7 +228,7 @@ def _indexer_k_norm_rope_quant_store_kernel(
         )
         amax = tl.maximum(amax, 6.0 * (2**-126))
         # ue8m0 block scale: 2^ceil(log2(amax / 6.0)), stored (exp + 127).
-        log2_ratio = tl.ceil(tl.log2(amax * (1.0 / 6.0)))
+        log2_ratio = ceil_log2(amax * (1.0 / 6.0))
         log2_ratio = tl.minimum(tl.maximum(log2_ratio, -127.0), 127.0)
         inv_scale = tl.exp2(-log2_ratio)
         ue8m0 = (log2_ratio + 127.0).to(tl.uint8)  # [N_QUANT_BLOCKS]
@@ -243,7 +247,7 @@ def _indexer_k_norm_rope_quant_store_kernel(
         result_bf16 = result.to(tl.bfloat16).to(tl.float32)
         INV_FP8_MAX: tl.constexpr = 1.0 / FP8_MAX
         absmax = tl.maximum(tl.max(tl.abs(result_bf16), axis=0), 1e-4)
-        exponent = tl.ceil(tl.log2(absmax * INV_FP8_MAX))
+        exponent = ceil_log2(absmax * INV_FP8_MAX)
         inv_scale = tl.exp2(-exponent)
         x_clamped = tl.clamp(result_bf16 * inv_scale, -FP8_MAX, FP8_MAX)
         if EMULATE_E4M3:

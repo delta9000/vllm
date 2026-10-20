@@ -33,6 +33,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.triton_utils.fp8_e4m3 import (
+    ceil_log2,
     e4m3fn_bits_to_fp32,
     fp32_to_e4m3fn_bits,
     needs_e4m3fn_emulation,
@@ -232,7 +233,7 @@ def _quantize_and_insert_k_mxfp8_kernel(
     # Floor the absmax like the CUDA encoder so an all-zero tile still lands on
     # a finite scale.
     amax = tl.maximum(tl.max(tl.abs(tiles), 1), 1e-4)
-    exponent = tl.ceil(tl.log2(amax * (1.0 / fp8_max)))
+    exponent = ceil_log2(amax * (1.0 / fp8_max))
     scaled = tl.clamp(
         tiles * tl.reshape(tl.exp2(-exponent), (scale_dim, 1)), -fp8_max, fp8_max
     )

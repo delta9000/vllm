@@ -91,3 +91,19 @@ def fp32_to_e4m3fn_bits(x):
     bits = tl.where(ax < 0.015625, sub_bits, norm_bits)
     bits = tl.where(x != x, 0x7F, bits)
     return (bits | (sign << 7)).to(tl.uint8)
+
+
+@triton.jit
+def ceil_log2(x):
+    """Exact ``ceil(log2(x))`` as float32, for positive normal float32 ``x``.
+
+    Block-scale exponents (UE8M0, power-of-two scales) need it exact.
+    ``tl.ceil(tl.log2(x))`` lowers to libdevice's ``log2f``, which returns k
+    instead of k + 1 for inputs a few ulps above ``2^k``: the scale comes out 2x
+    too small and the block's largest values saturate. Reading the exponent
+    field is exact, matches the reference's ``fast_round_scale``, and is
+    cheaper. Callers floor ``x`` above the subnormal range.
+    """
+    bits = x.to(tl.int32, bitcast=True)
+    e = ((bits >> 23) & 0xFF) - 127 + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    return e.to(tl.float32)

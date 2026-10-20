@@ -14,7 +14,11 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.triton_utils.fp8_e4m3 import fp32_to_e4m3fn_bits, needs_e4m3fn_emulation
+from vllm.triton_utils.fp8_e4m3 import (
+    ceil_log2,
+    fp32_to_e4m3fn_bits,
+    needs_e4m3fn_emulation,
+)
 from vllm.utils.import_utils import has_cutedsl
 
 # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
@@ -67,7 +71,7 @@ def _quantize_mxfp4_pair(x_lo, x_hi):
     # 6 * 2^-126 is from https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/inference/kernel.py#L163
     amax = tl.maximum(amax, 6.0 * (2**-126))
     # ue8m0 block scale: 2^ceil(log2(amax/6.0)).
-    log2_ratio = tl.math.ceil(tl.math.log2(amax * (1.0 / 6.0)))
+    log2_ratio = ceil_log2(amax * (1.0 / 6.0))
     log2_ratio = tl.minimum(tl.maximum(log2_ratio, -127.0), 127.0)
     scale = tl.math.exp2(log2_ratio)
     ue8m0 = (log2_ratio + 127.0).to(tl.uint8)
@@ -164,7 +168,7 @@ class FusedIndexerQRopeQuantTritonKernel(
             x_nope = tl.load(base_ptr + nope_offset).to(tl.float32)
             amax = tl.maximum(amax, tl.max(tl.abs(x_nope)))
         index_q_scale = tl.div_rn(tl.maximum(amax, 1e-4), FP8_MAX)
-        index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
+        index_q_scale = tl.math.exp2(ceil_log2(index_q_scale))
 
         # Store quantized values to index_q_fp8. FNUZ (e4m3fnuz) on gfx942, OCP
         # (e4m3fn) elsewhere -- matches the K cache. With EMULATE_E4M3 the
