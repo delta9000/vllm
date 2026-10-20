@@ -511,7 +511,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             pre_mix=pre_mix,
             norm_weight=self.attn_norm.weight,
             norm_eps=self.attn_norm.variance_epsilon,
-            reduce_results=self.fuse_mhc_all_reduce,
         )
         self.attn.forward_kv(positions, x)
 
